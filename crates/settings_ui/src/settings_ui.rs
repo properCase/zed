@@ -46,7 +46,7 @@ use ui::{
 use util::{ResultExt as _, paths::PathStyle, rel_path::RelPath};
 use workspace::{
     AppState, MultiWorkspace, OpenOptions, OpenVisible, Workspace, WorkspaceSettings,
-    client_side_decorations,
+    WorkspaceStoreEvent, client_side_decorations,
 };
 use zed_actions::{
     AGENT_SKILLS_SETTINGS_PATH, OpenProjectSettings, OpenSettings, OpenSettingsAt,
@@ -1899,76 +1899,23 @@ impl SettingsWindow {
             .collect();
 
         for workspace in workspaces {
-            let project = workspace.read(cx).project().clone();
-            cx.observe_release_in(&project, window, |this, _, window, cx| {
-                this.fetch_files(window, cx)
-            })
-            .detach();
-            cx.subscribe_in(&project, window, Self::handle_project_event)
-                .detach();
-            cx.observe_release_in(&workspace, window, |this, _, window, cx| {
-                this.fetch_files(window, cx)
-            })
-            .detach();
+            Self::observe_workspace(&workspace, window, cx);
         }
 
-        let this_weak = cx.weak_entity();
-        cx.observe_new::<Project>({
-            let this_weak = this_weak.clone();
-
-            move |_, window, cx| {
-                let project = cx.entity();
-                let Some(window) = window else {
-                    return;
-                };
-
-                this_weak
-                    .update(cx, |_, cx| {
-                        cx.defer_in(window, |settings_window, window, cx| {
-                            settings_window.fetch_files(window, cx)
-                        });
-                        cx.observe_release_in(&project, window, |_, _, window, cx| {
-                            cx.defer_in(window, |this, window, cx| this.fetch_files(window, cx));
-                        })
-                        .detach();
-
-                        cx.subscribe_in(&project, window, Self::handle_project_event)
-                            .detach();
-                    })
-                    .ok();
-            }
-        })
-        .detach();
-
-        let handle = window.window_handle();
-        cx.observe_new::<Workspace>(move |workspace, _, cx| {
-            let project = workspace.project().clone();
-            let this_weak = this_weak.clone();
-
-            // We defer on the settings window (via `handle`) rather than using
-            // the workspace's window from observe_new. When window.defer() runs
-            // its callback, it calls handle.update() which temporarily removes
-            // that window from cx.windows. If we deferred on the workspace's
-            // window, then when fetch_files() tries to read ALL workspaces from
-            // the store (including the newly created one), it would fail with
-            // "window not found" because that workspace's window would be
-            // temporarily removed from cx.windows for the duration of our callback.
-            handle
-                .update(cx, move |_, window, cx| {
-                    window.defer(cx, move |window, cx| {
-                        this_weak
-                            .update(cx, |this, cx| {
-                                this.fetch_files(window, cx);
-                                cx.observe_release_in(&project, window, |this, _, window, cx| {
-                                    this.fetch_files(window, cx)
-                                })
-                                .detach();
-                            })
-                            .ok();
-                    });
-                })
-                .ok();
-        })
+        cx.subscribe_in(
+            &app_state.workspace_store,
+            window,
+            |_, _, event, window, cx| {
+                let WorkspaceStoreEvent::WorkspaceAdded(workspace) = event;
+                if let Some(workspace) = workspace.upgrade() {
+                    Self::observe_workspace(&workspace, window, cx);
+                }
+                cx.defer_in(window, |settings_window, window, cx| {
+                    settings_window.fetch_files(window, cx);
+                    cx.notify();
+                });
+            },
+        )
         .detach();
 
         let title_bar = if !cfg!(target_os = "macos") {
@@ -2054,6 +2001,17 @@ impl SettingsWindow {
                 editor.set_text("", window, cx);
             });
         }
+    }
+
+    fn observe_workspace(workspace: &Entity<Workspace>, window: &Window, cx: &mut Context<Self>) {
+        let project = workspace.read(cx).project().clone();
+
+        cx.subscribe_in(&project, window, Self::handle_project_event)
+            .detach();
+        cx.observe_release_in(workspace, window, |settings_window, _, window, cx| {
+            settings_window.fetch_files(window, cx)
+        })
+        .detach();
     }
 
     fn handle_project_event(
@@ -5440,6 +5398,10 @@ fn render_icon_theme_picker(
 pub mod test {
 
     use super::*;
+    use futures::{FutureExt as _, channel::oneshot};
+    use language::{Language, LanguageConfig, LanguageName, LanguageQueries, LoadedLanguage};
+    use serde_json::json;
+    use util::path;
     use credentials_provider::test_support::FakeCredentialsProvider;
     use language_model::{ApiKeyState, EnvVar, LanguageModelProviderState, LanguageModelRegistry};
     use language_models::provider::open_ai_compatible::OpenAiCompatibleLanguageModelProvider;
@@ -6946,6 +6908,207 @@ pub mod test {
                 "Should have no duplicate project files, but found duplicates. All files: {:?}",
                 project_files
             );
+        });
+
+        fake_fs
+            .insert_tree("/workspace3", json!({ "worktree_c": {} }))
+            .await;
+        let opened = cx
+            .update(|_, cx| {
+                Workspace::new_local(
+                    vec![PathBuf::from("/workspace3/worktree_c")],
+                    app_state.clone(),
+                    None,
+                    None,
+                    None,
+                    workspace::OpenMode::NewWindow,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        settings_window.read_with(cx, |settings_window, cx| {
+            assert!(!opened.workspace.read(cx).is_restoring());
+            let mut worktree_names = settings_window
+                .worktree_root_dirs
+                .values()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            worktree_names.sort_unstable();
+            assert_eq!(worktree_names, ["worktree_a", "worktree_b", "worktree_c"]);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_settings_window_opened_during_workspace_restoration(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let app_state = cx.update(|cx| {
+            register_settings(cx);
+            let app_state = AppState::test(cx);
+            AppState::set_global(app_state.clone(), cx);
+            app_state
+        });
+        let fake_fs = app_state.fs.as_fake();
+        fake_fs.insert_tree(path!("/pending"), json!({})).await;
+        fake_fs.insert_tree(path!("/added"), json!({})).await;
+        let saved = cx
+            .update(|cx| {
+                Workspace::new_local(
+                    vec![PathBuf::from(path!("/pending"))],
+                    app_state.clone(),
+                    None,
+                    None,
+                    None,
+                    workspace::OpenMode::NewWindow,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        let editor = saved
+            .window
+            .update(cx, |_, window, cx| {
+                saved.workspace.update(cx, |workspace, cx| {
+                    Editor::new_in_workspace(workspace, window, cx)
+                })
+            })
+            .unwrap()
+            .await
+            .unwrap();
+        let language_config = LanguageConfig {
+            name: LanguageName::new_static("Delayed"),
+            ..LanguageConfig::default()
+        };
+        saved
+            .window
+            .update(cx, |_, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    editor.insert("draft", window, cx);
+                    editor
+                        .buffer()
+                        .read(cx)
+                        .as_singleton()
+                        .unwrap()
+                        .update(cx, |buffer, cx| {
+                            buffer.set_content_language_detection_enabled(false);
+                            buffer.set_language(
+                                Some(Arc::new(Language::new(language_config.clone(), None))),
+                                cx,
+                            );
+                        });
+                });
+                saved.workspace.update(cx, |workspace, cx| {
+                    workspace.flush_serialization(window, cx)
+                })
+            })
+            .unwrap()
+            .await;
+        saved
+            .window
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+        drop(editor);
+        drop(saved);
+        cx.run_until_parked();
+
+        let initial = cx
+            .update(|cx| {
+                Workspace::new_local(
+                    Vec::new(),
+                    app_state.clone(),
+                    None,
+                    None,
+                    None,
+                    workspace::OpenMode::NewWindow,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        let (resume, pending) = oneshot::channel::<()>();
+        let pending = pending.shared();
+        app_state.languages.register_language(
+            language_config.name.clone(),
+            None,
+            language_config.matcher.clone(),
+            false,
+            None,
+            Arc::new(move || {
+                let pending = pending.clone();
+                let config = language_config.clone();
+                async move {
+                    pending.await?;
+                    Ok(LoadedLanguage {
+                        config,
+                        queries: LanguageQueries::default(),
+                        context_provider: None,
+                        toolchain_provider: None,
+                        manifest_name: None,
+                    })
+                }
+                .boxed()
+            }),
+        );
+        let (constructed, created) = oneshot::channel();
+        let opening = cx.update(|cx| {
+            Workspace::new_local(
+                vec![PathBuf::from(path!("/pending"))],
+                app_state.clone(),
+                Some(initial.window),
+                None,
+                Some(Box::new(move |_, _, cx| {
+                    constructed.send(cx.weak_entity()).unwrap();
+                })),
+                workspace::OpenMode::Add,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert!(!opening.is_ready());
+        let pending_workspace = created.await.unwrap().upgrade().unwrap();
+        assert!(!pending_workspace.read_with(cx, |workspace, _| workspace.is_published()));
+        let (settings_window, cx) =
+            cx.add_window_view(|window, cx| SettingsWindow::new(Some(initial.window), window, cx));
+        cx.run_until_parked();
+        settings_window.read_with(cx, |settings_window, _| {
+            assert_eq!(settings_window.worktree_root_dirs, HashMap::new());
+        });
+
+        resume.send(()).unwrap();
+        let opened = opening.await.unwrap();
+        cx.run_until_parked();
+        assert_eq!(opened.workspace, pending_workspace);
+        settings_window.read_with(cx, |settings_window, cx| {
+            assert!(opened.workspace.read(cx).is_published());
+            assert_eq!(
+                settings_window
+                    .worktree_root_dirs
+                    .values()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                ["pending"]
+            );
+        });
+        opened
+            .workspace
+            .read_with(cx, |workspace, _| workspace.project().clone())
+            .update(cx, |project, cx| {
+                project.find_or_create_worktree(path!("/added"), true, cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        settings_window.read_with(cx, |settings_window, _| {
+            let mut worktree_names = settings_window
+                .worktree_root_dirs
+                .values()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            worktree_names.sort_unstable();
+            assert_eq!(worktree_names, ["added", "pending"]);
         });
     }
 

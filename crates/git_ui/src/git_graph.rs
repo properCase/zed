@@ -11,6 +11,7 @@ use crate::{
 use collections::{BTreeMap, HashMap, IndexSet};
 use editor::Editor;
 use file_icons::FileIcons;
+use futures::future::BoxFuture;
 use git::{
     BuildCommitPermalinkParams, GitHostingProviderRegistry, GitRemote, Oid, ParsedGitRemote,
     parse_git_remote_url,
@@ -4951,7 +4952,7 @@ impl workspace::SerializableItem for GitGraph {
         item_id: workspace::ItemId,
         _closing: bool,
         cx: &mut Context<Self>,
-    ) -> Option<Task<gpui::Result<()>>> {
+    ) -> Option<BoxFuture<'static, gpui::Result<db::Write>>> {
         let workspace_id = workspace.database_id()?;
         let repo = self.get_repository(cx)?;
         let repo_working_path = repo
@@ -4981,9 +4982,8 @@ impl workspace::SerializableItem for GitGraph {
             self.column_visibility.as_slice(),
         ));
 
-        let db = persistence::GitGraphsDb::global(cx);
-        Some(cx.background_spawn(async move {
-            db.save_git_graph(
+        Some(Box::pin(async move {
+            Ok(persistence::GitGraphsDb::prepare_save_git_graph(
                 item_id,
                 workspace_id,
                 repo_working_path,
@@ -4994,8 +4994,7 @@ impl workspace::SerializableItem for GitGraph {
                 search_query,
                 search_case_sensitive,
                 hidden_columns,
-            )
-            .await
+            ))
         }))
     }
 
@@ -5158,7 +5157,7 @@ mod persistence {
 
     impl GitGraphsDb {
         query! {
-            pub async fn save_git_graph(
+            pub fn prepare_save_git_graph(
                 item_id: workspace::ItemId,
                 workspace_id: workspace::WorkspaceId,
                 repo_working_path: String,
@@ -5169,7 +5168,7 @@ mod persistence {
                 search_query: Option<String>,
                 search_case_sensitive: Option<bool>,
                 hidden_columns: Option<i32>
-            ) -> Result<()> {
+            ) -> Write {
                 INSERT OR REPLACE INTO git_graphs(
                     item_id, workspace_id, repo_working_path,
                     log_source_type, log_source_value, log_order,
@@ -6734,7 +6733,7 @@ mod tests {
         // Hide the "Date" column (index 2 in the non-path-history layout).
         let hidden_columns =
             persistence::serialize_hidden_columns(&[false, false, true, false, false]);
-        db.save_git_graph(
+        let write = persistence::GitGraphsDb::prepare_save_git_graph(
             item_id,
             workspace_id,
             "/project".to_string(),
@@ -6745,9 +6744,9 @@ mod tests {
             Some("some query".to_string()),
             Some(true),
             Some(hidden_columns),
-        )
-        .await
-        .expect("save should succeed");
+        );
+        assert_eq!(db.get_git_graph(item_id, workspace_id).unwrap(), None);
+        db.write(write).await.expect("save should succeed");
 
         let restored_graph = cx
             .update(|window, cx| {

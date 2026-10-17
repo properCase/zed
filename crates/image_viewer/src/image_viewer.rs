@@ -30,7 +30,10 @@ use workspace::{
     ItemId, ItemSettings, Pane, ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView, Workspace,
     WorkspaceId, delete_unloaded_items,
     invalid_item_view::InvalidItemView,
-    item::{HighlightedText, Item, ItemHandle, ProjectItem, SerializableItem, TabContentParams},
+    item::{
+        BoxFuture, HighlightedText, Item, ItemHandle, ProjectItem, SerializableItem,
+        TabContentParams,
+    },
 };
 
 pub use crate::image_info::*;
@@ -738,16 +741,17 @@ impl SerializableItem for ImageView {
         item_id: ItemId,
         _closing: bool,
         cx: &mut Context<Self>,
-    ) -> Option<Task<anyhow::Result<()>>> {
+    ) -> Option<BoxFuture<'static, anyhow::Result<db::Write>>> {
         let workspace_id = workspace.database_id()?;
         let image_path = self.image_item.read(cx).abs_path(cx)?;
 
-        let db = ImageViewerDb::global(cx);
-        Some(cx.background_spawn({
-            async move {
-                log::debug!("Saving image at path {image_path:?}");
-                db.save_image_path(item_id, workspace_id, image_path).await
-            }
+        Some(Box::pin(async move {
+            log::debug!("Saving image at path {image_path:?}");
+            Ok(ImageViewerDb::prepare_save_image_path(
+                item_id,
+                workspace_id,
+                image_path,
+            ))
         }))
     }
 
@@ -1382,11 +1386,11 @@ mod persistence {
 
     impl ImageViewerDb {
         query! {
-            pub async fn save_image_path(
+            pub fn prepare_save_image_path(
                 item_id: ItemId,
                 workspace_id: WorkspaceId,
                 image_path: PathBuf
-            ) -> Result<()> {
+            ) -> Write {
                 INSERT OR REPLACE INTO image_viewers(item_id, workspace_id, image_path)
                 VALUES (?, ?, ?)
             }

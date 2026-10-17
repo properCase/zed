@@ -1465,6 +1465,7 @@ struct FakeFsState {
     events_paused: bool,
     buffered_events: Vec<PathEvent>,
     metadata_call_count: usize,
+    metadata_errors: std::collections::HashMap<PathBuf, io::ErrorKind>,
     read_dir_call_count: usize,
     read_dir_hooks: BTreeMap<PathBuf, BoxFuture<'static, ()>>,
     path_write_counts: std::collections::HashMap<PathBuf, usize>,
@@ -1862,6 +1863,7 @@ impl FakeFs {
             events_paused: false,
             read_dir_call_count: 0,
             metadata_call_count: 0,
+            metadata_errors: std::collections::HashMap::default(),
             read_dir_hooks: Default::default(),
             path_write_counts: Default::default(),
             job_event_subscribers: Arc::new(Mutex::new(Vec::new())),
@@ -2683,6 +2685,13 @@ impl FakeFs {
         .unwrap();
     }
 
+    pub fn set_metadata_error(&self, path: impl AsRef<Path>, error: io::ErrorKind) {
+        self.state
+            .lock()
+            .metadata_errors
+            .insert(normalize_path(path.as_ref()), error);
+    }
+
     /// Makes subsequent `remove_dir` calls for `path` fail with `message`.
     pub fn set_remove_dir_error(&self, path: impl AsRef<Path>, message: String) {
         self.state
@@ -3364,6 +3373,9 @@ impl Fs for FakeFs {
         let path = normalize_path(path);
         let mut state = self.state.lock();
         state.metadata_call_count += 1;
+        if let Some(error) = state.metadata_errors.get(&path) {
+            return Err(io::Error::from(*error).into());
+        }
         if let Some((mut entry, _)) = state.try_entry(&path, false) {
             let is_symlink = entry.is_symlink();
             if is_symlink {

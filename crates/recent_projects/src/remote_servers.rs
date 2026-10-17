@@ -1,7 +1,8 @@
 use crate::{
     remote_connections::{
-        Connection, RemoteConnectionModal, RemoteConnectionPrompt, RemoteSettings, SshConnection,
-        SshConnectionHeader, connect, determine_paths_with_positions, open_remote_project,
+        Connection, RemoteConnectionModal, RemoteConnectionPrompt, RemoteOpenSource,
+        RemoteSettings, SshConnection, SshConnectionHeader, connect,
+        determine_paths_with_positions, open_remote_project, open_remote_project_impl,
     },
     ssh_config::parse_ssh_config_hosts,
 };
@@ -450,15 +451,15 @@ impl ProjectPicker {
                         project.remote_client()?.read(cx).connection()
                     })?;
 
-                    let (paths, paths_with_positions) =
+                    let paths_with_positions =
                         determine_paths_with_positions(&remote_connection, paths).await;
 
                     cx.update(|_, cx| {
                         let fs = app_state.fs.clone();
                         update_settings_file(fs, cx, {
-                            let paths = paths
+                            let paths = paths_with_positions
                                 .iter()
-                                .map(|path| path.to_string_lossy().into_owned())
+                                .map(|path| path.path.to_string_lossy().into_owned())
                                 .collect();
                             move |settings, _| match index {
                                 ServerIndex::Ssh(index) => {
@@ -503,7 +504,17 @@ impl ProjectPicker {
                     }?;
 
                     let items = open_remote_project_with_existing_connection(
-                        connection, project, paths, app_state, window, None, None, cx,
+                        connection,
+                        project,
+                        paths_with_positions
+                            .iter()
+                            .map(|path| path.path.clone())
+                            .collect(),
+                        app_state,
+                        window,
+                        None,
+                        None,
+                        cx,
                     )
                     .await
                     .log_err()
@@ -2242,7 +2253,10 @@ impl RemoteServerProjects {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let replace_window = window.window_handle().downcast::<MultiWorkspace>();
+        let Some(window_handle) = window.window_handle().downcast::<MultiWorkspace>() else {
+            return;
+        };
+        let workspace = self.workspace.clone();
         let app_state = Arc::downgrade(&app_state);
 
         cx.spawn_in(window, async move |entity, cx| {
@@ -2295,14 +2309,12 @@ impl RemoteServerProjects {
             let Some(app_state) = app_state.upgrade() else {
                 return;
             };
-            let result = open_remote_project(
+            let result = open_remote_project_impl(
                 Connection::DevContainer(dev_container_connection).into(),
-                vec![starting_dir].into_iter().map(PathBuf::from).collect(),
+                vec![PathBuf::from(starting_dir)],
                 app_state,
-                OpenOptions {
-                    requesting_window: replace_window,
-                    ..OpenOptions::default()
-                },
+                OpenOptions::default(),
+                Some(RemoteOpenSource::Workspace(window_handle, workspace)),
                 cx,
             )
             .await;

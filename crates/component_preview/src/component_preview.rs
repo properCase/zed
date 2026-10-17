@@ -19,7 +19,8 @@ use ui::{
 use ui_input::InputField;
 use workspace::AppState;
 use workspace::{
-    Item, ItemId, SerializableItem, Workspace, WorkspaceId, delete_unloaded_items, item::ItemEvent,
+    Item, ItemId, SerializableItem, Workspace, WorkspaceId, delete_unloaded_items,
+    item::{BoxFuture, ItemEvent},
 };
 
 pub fn init(app_state: Arc<AppState>, cx: &mut App) {
@@ -864,13 +865,15 @@ impl SerializableItem for ComponentPreview {
         item_id: ItemId,
         _closing: bool,
         cx: &mut Context<Self>,
-    ) -> Option<Task<anyhow::Result<()>>> {
+    ) -> Option<BoxFuture<'static, anyhow::Result<db::Write>>> {
         let active_page = self.active_page_id(cx);
         let workspace_id = self.workspace_id?;
-        let db = ComponentPreviewDb::global(cx);
-        Some(cx.background_spawn(async move {
-            db.save_active_page(item_id, workspace_id, active_page.0)
-                .await
+        Some(Box::pin(async move {
+            Ok(ComponentPreviewDb::prepare_save_active_page(
+                item_id,
+                workspace_id,
+                active_page.0,
+            ))
         }))
     }
 

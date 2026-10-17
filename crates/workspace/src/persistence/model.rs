@@ -1,15 +1,17 @@
-use super::{SerializedAxis, SerializedWindowBounds, UNAVAILABLE_SESSION_WORKSPACE_RETENTION};
+use super::{SerializedAxis, SerializedWindowBounds};
 use crate::{
-    Member, Pane, PaneAxis, SerializableItemRegistry, Workspace, WorkspaceId, item::ItemHandle,
-    multi_workspace::SerializedProjectGroupState, path_list::PathList,
+    Member, Pane, PaneAxis, SerializableItemRegistry, Workspace, WorkspaceId,
+    item::{ItemHandle, SavedItemRestoreError},
+    multi_workspace::SerializedProjectGroupState,
+    path_list::PathList,
 };
 use anyhow::Result;
-use collections::{HashSet, IndexSet};
+use collections::IndexSet;
 use db::sqlez::{
     bindable::{Bind, Column, StaticColumnCount},
     statement::Statement,
 };
-use gpui::{App, Context, Entity, Task, WeakEntity, Window, WindowId};
+use gpui::{AsyncWindowContext, Entity, WeakEntity, WindowId};
 
 use language::{Toolchain, ToolchainScope};
 use project::{
@@ -58,42 +60,7 @@ pub struct SessionWorkspace {
     pub workspace_id: WorkspaceId,
     pub location: SerializedWorkspaceLocation,
     pub paths: PathList,
-    pub session_id: Option<String>,
     pub window_id: Option<WindowId>,
-}
-
-impl SessionWorkspace {
-    pub fn session_window(&self) -> Option<SessionWindow> {
-        self.binding().window()
-    }
-
-    pub fn binding(&self) -> SessionBinding {
-        SessionBinding {
-            session_id: self.session_id.clone(),
-            window_id: self.window_id.map(|window_id| window_id.as_u64()),
-        }
-    }
-}
-
-#[derive(Debug, PartialEq, Clone)]
-pub struct SessionWindow {
-    pub session_id: String,
-    pub window_id: u64,
-}
-
-#[derive(Debug, PartialEq, Clone, Default)]
-pub struct SessionBinding {
-    pub session_id: Option<String>,
-    pub window_id: Option<u64>,
-}
-
-impl SessionBinding {
-    pub fn window(&self) -> Option<SessionWindow> {
-        Some(SessionWindow {
-            session_id: self.session_id.clone()?,
-            window_id: self.window_id?,
-        })
-    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -156,6 +123,7 @@ pub struct MultiWorkspaceState {
 #[derive(Debug, Clone)]
 pub struct SerializedMultiWorkspace {
     pub active_workspace: SessionWorkspace,
+    pub scratch_workspaces: Vec<WorkspaceId>,
     pub state: MultiWorkspaceState,
 }
 
@@ -182,13 +150,7 @@ pub(crate) struct SerializedWorkspace {
     pub(crate) user_toolchains: BTreeMap<ToolchainScope, IndexSet<Toolchain>>,
     pub(crate) recent_navigation_history: Vec<PathBuf>,
     pub(crate) window_id: Option<u64>,
-    pub(crate) unserialized_root_files: Option<UnserializedRootFiles>,
-}
-
-#[derive(Debug, PartialEq, Clone, Default)]
-pub(crate) struct UnserializedRootFiles {
-    pub(crate) paths: PathList,
-    pub(crate) active: Option<PathBuf>,
+    pub(crate) restoring_window_id: Option<i64>,
 }
 
 #[derive(Debug, PartialEq, Clone, Default, Serialize, Deserialize)]
@@ -294,137 +256,109 @@ impl Default for SerializedPaneGroup {
 }
 
 impl SerializedPaneGroup {
-    pub(crate) fn restorable_panes(&self) -> Vec<&SerializedPane> {
+    pub(crate) async fn deserialize(
+        self,
+        project: &Entity<Project>,
+        workspace_id: WorkspaceId,
+        workspace: WeakEntity<Workspace>,
+        cx: &mut AsyncWindowContext,
+    ) -> Result<
+        Option<(
+            Member,
+            Option<Entity<Pane>>,
+            Vec<Option<Box<dyn ItemHandle>>>,
+        )>,
+    > {
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().downgrade())?;
+        let mut items = Vec::new();
+        for serialized_pane in self.panes() {
+            items.extend(
+                serialized_pane
+                    .deserialize_items(project, &pane, workspace_id, workspace.clone(), cx)
+                    .await?,
+            );
+        }
+        self.deserialize_prepared(&mut items.into_iter(), workspace, cx)
+    }
+
+    fn panes(&self) -> Box<dyn Iterator<Item = &SerializedPane> + '_> {
         match self {
-            SerializedPaneGroup::Group { children, .. } => children
-                .iter()
-                .flat_map(SerializedPaneGroup::restorable_panes)
-                .collect(),
-            SerializedPaneGroup::Pane(serialized_pane) => {
-                if serialized_pane.children.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![serialized_pane]
-                }
-            }
+            Self::Group { children, .. } => Box::new(children.iter().flat_map(Self::panes)),
+            Self::Pane(pane) => Box::new(std::iter::once(pane)),
         }
     }
 
-    pub(crate) fn build_restored_member(
-        &self,
-        mut pane_for_leaf: impl FnMut(&SerializedPane) -> Entity<Pane>,
-    ) -> Option<Member> {
-        self.build_member(&mut pane_for_leaf)
-    }
-
-    fn build_member(
-        &self,
-        pane_for_leaf: &mut dyn FnMut(&SerializedPane) -> Entity<Pane>,
-    ) -> Option<Member> {
+    fn deserialize_prepared(
+        self,
+        prepared_items: &mut impl Iterator<Item = Option<Box<dyn ItemHandle>>>,
+        workspace: WeakEntity<Workspace>,
+        cx: &mut AsyncWindowContext,
+    ) -> Result<
+        Option<(
+            Member,
+            Option<Entity<Pane>>,
+            Vec<Option<Box<dyn ItemHandle>>>,
+        )>,
+    > {
         match self {
             SerializedPaneGroup::Group {
                 axis,
                 children,
                 flexes,
             } => {
-                let mut members = children
-                    .iter()
-                    .filter_map(|child| child.build_member(pane_for_leaf))
-                    .collect::<Vec<_>>();
-                match members.len() {
-                    0 => None,
-                    1 => members.pop(),
-                    _ => Some(Member::Axis(PaneAxis::load(
-                        axis.0,
-                        members,
-                        flexes.clone(),
-                    ))),
+                let mut current_active_pane = None;
+                let mut members = Vec::new();
+                let mut items = Vec::new();
+                for child in children {
+                    if let Some((new_member, active_pane, new_items)) =
+                        child.deserialize_prepared(prepared_items, workspace.clone(), cx)?
+                    {
+                        members.push(new_member);
+                        items.extend(new_items);
+                        current_active_pane = current_active_pane.or(active_pane);
+                    }
                 }
+
+                if members.is_empty() {
+                    return Ok(None);
+                }
+
+                if members.len() == 1 {
+                    return Ok(Some((members.remove(0), current_active_pane, items)));
+                }
+
+                Ok(Some((
+                    Member::Axis(PaneAxis::load(axis.0, members, flexes)),
+                    current_active_pane,
+                    items,
+                )))
             }
             SerializedPaneGroup::Pane(serialized_pane) => {
-                if serialized_pane.children.is_empty() {
-                    None
+                let pane = workspace
+                    .update_in(cx, |workspace, window, cx| workspace.add_pane(window, cx))?;
+                let active = serialized_pane.active;
+                let new_items = prepared_items
+                    .take(serialized_pane.children.len())
+                    .collect();
+                let new_items = serialized_pane.add_items(
+                    new_items,
+                    &pane.downgrade(),
+                    workspace.clone(),
+                    cx,
+                )?;
+
+                if pane.read_with(cx, |pane, _| pane.items_len() != 0) {
+                    Ok(Some((
+                        Member::Pane(pane.clone()),
+                        active.then_some(pane),
+                        new_items,
+                    )))
                 } else {
-                    Some(Member::Pane(pane_for_leaf(serialized_pane)))
+                    workspace.update_in(cx, |workspace, window, cx| {
+                        workspace.force_remove_pane(&pane, &None, window, cx)
+                    })?;
+                    Ok(None)
                 }
-            }
-        }
-    }
-
-    pub(crate) fn item_count(&self) -> usize {
-        match self {
-            SerializedPaneGroup::Group { children, .. } => {
-                children.iter().map(SerializedPaneGroup::item_count).sum()
-            }
-            SerializedPaneGroup::Pane(serialized_pane) => serialized_pane.children.len(),
-        }
-    }
-
-    pub(crate) fn item_keys(&self) -> HashSet<(Arc<str>, ItemId)> {
-        match self {
-            SerializedPaneGroup::Group { children, .. } => children
-                .iter()
-                .flat_map(SerializedPaneGroup::item_keys)
-                .collect(),
-            SerializedPaneGroup::Pane(serialized_pane) => serialized_pane
-                .children
-                .iter()
-                .map(SerializedItem::key)
-                .collect(),
-        }
-    }
-
-    pub(crate) fn item_ids(&self) -> Vec<ItemId> {
-        match self {
-            SerializedPaneGroup::Group { children, .. } => children
-                .iter()
-                .flat_map(SerializedPaneGroup::item_ids)
-                .collect(),
-            SerializedPaneGroup::Pane(serialized_pane) => serialized_pane
-                .children
-                .iter()
-                .map(|item| item.item_id)
-                .collect(),
-        }
-    }
-
-    pub(crate) fn append_unrestored_items(&mut self, live_items: Vec<SerializedItem>) {
-        let saved_keys = self.item_keys();
-        let items = live_items
-            .into_iter()
-            .filter(|item| !saved_keys.contains(&item.key()))
-            .collect::<Vec<_>>();
-        if items.is_empty() {
-            return;
-        }
-        let has_active_pane = self.has_active_pane();
-        let Some(pane) = self.first_pane_mut(has_active_pane) else {
-            return;
-        };
-        if items.iter().any(|item| item.active) {
-            for child in &mut pane.children {
-                child.active = false;
-            }
-        }
-        pane.children.extend(items);
-    }
-
-    fn has_active_pane(&self) -> bool {
-        match self {
-            SerializedPaneGroup::Group { children, .. } => {
-                children.iter().any(SerializedPaneGroup::has_active_pane)
-            }
-            SerializedPaneGroup::Pane(serialized_pane) => serialized_pane.active,
-        }
-    }
-
-    fn first_pane_mut(&mut self, active_only: bool) -> Option<&mut SerializedPane> {
-        match self {
-            SerializedPaneGroup::Group { children, .. } => children
-                .iter_mut()
-                .find_map(|child| child.first_pane_mut(active_only)),
-            SerializedPaneGroup::Pane(serialized_pane) => {
-                (!active_only || serialized_pane.active).then_some(serialized_pane)
             }
         }
     }
@@ -446,152 +380,108 @@ impl SerializedPane {
         }
     }
 
-    pub(crate) fn deserialize_items(
+    #[cfg(test)]
+    pub async fn deserialize_to(
         &self,
         project: &Entity<Project>,
-        workspace: WeakEntity<Workspace>,
+        pane: &WeakEntity<Pane>,
         workspace_id: WorkspaceId,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> Vec<Task<Result<Box<dyn ItemHandle>>>> {
-        self.children
-            .iter()
-            .map(|item| {
+        workspace: WeakEntity<Workspace>,
+        cx: &mut AsyncWindowContext,
+    ) -> Result<Vec<Option<Box<dyn ItemHandle>>>> {
+        let items = self
+            .deserialize_items(project, pane, workspace_id, workspace.clone(), cx)
+            .await?;
+        self.add_items(items, pane, workspace, cx)
+    }
+
+    async fn deserialize_items(
+        &self,
+        project: &Entity<Project>,
+        pane: &WeakEntity<Pane>,
+        workspace_id: WorkspaceId,
+        workspace: WeakEntity<Workspace>,
+        cx: &mut AsyncWindowContext,
+    ) -> Result<Vec<Option<Box<dyn ItemHandle>>>> {
+        let mut item_tasks = Vec::new();
+        for item in &self.children {
+            let project = project.clone();
+            item_tasks.push(pane.update_in(cx, |_, window, cx| {
                 SerializableItemRegistry::deserialize(
                     &item.kind,
-                    project.clone(),
+                    project,
                     workspace.clone(),
                     workspace_id,
                     item.item_id,
                     window,
                     cx,
                 )
+            })?);
+        }
+        futures::future::join_all(item_tasks)
+            .await
+            .into_iter()
+            .map(|result| match result {
+                Ok(item) => Ok(Some(item)),
+                Err(error) if error.is::<SavedItemRestoreError>() => Err(error),
+                Err(error) => {
+                    log::error!("{error:#}");
+                    Ok(None)
+                }
             })
             .collect()
     }
 
-    pub(crate) fn place_restored_items(
+    fn add_items(
         &self,
-        pane: &mut Pane,
-        items: &[Option<Box<dyn ItemHandle>>],
-        window: &mut Window,
-        cx: &mut Context<Pane>,
-    ) -> Vec<Option<Box<dyn ItemHandle>>> {
-        let pane_had_items = pane.items_len() > 0;
-        let first_index = pane.pinned_count();
-        let mut next_index = first_index;
-        let mut restored_pinned_count = 0;
-        let mut active_item = None;
-        let mut preview_item = None;
-        let mut placed_items = Vec::with_capacity(items.len());
-        for (child_index, (serialized_item, item)) in self.children.iter().zip(items).enumerate() {
-            let Some(item) = item else {
-                placed_items.push(None);
-                continue;
-            };
-            let (item, inserted) = if pane_had_items {
-                pane.insert_restored_item(item.boxed_clone(), next_index, cx)
-            } else {
-                pane.add_item_inner(
-                    item.boxed_clone(),
-                    false,
-                    false,
-                    true,
-                    Some(next_index),
-                    window,
-                    cx,
-                );
-                (item.boxed_clone(), true)
-            };
-            if inserted {
-                next_index += 1;
-                if child_index < self.pinned_count {
-                    restored_pinned_count += 1;
+        items: Vec<Option<Box<dyn ItemHandle>>>,
+        pane: &WeakEntity<Pane>,
+        workspace: WeakEntity<Workspace>,
+        cx: &mut AsyncWindowContext,
+    ) -> Result<Vec<Option<Box<dyn ItemHandle>>>> {
+        let active_item_index = self.children.iter().rposition(|item| item.active);
+        let preview_item_index = self.children.iter().rposition(|item| item.preview);
+        for item_handle in items.iter().flatten() {
+            workspace.update(cx, |workspace, _| {
+                if workspace.is_restoring() {
+                    workspace.restored_items.insert(item_handle.item_id());
                 }
-                if serialized_item.preview {
-                    preview_item = Some(item.item_id());
-                }
-            }
-            if serialized_item.active {
-                active_item = Some(item.boxed_clone());
-            }
-            placed_items.push(Some(item));
+            })?;
+            let focus = workspace.read_with(cx, |workspace, _| {
+                workspace.owns_window_chrome() && !workspace.is_restoring()
+            })?;
+            pane.update_in(cx, |pane, window, cx| {
+                pane.add_item(item_handle.clone(), true, focus, None, window, cx);
+            })?;
         }
 
-        if !pane_had_items
-            && let Some(index) = active_item
-                .as_ref()
-                .and_then(|item| pane.index_for_item(item.as_ref()))
-        {
-            pane.activate_item(index, false, false, window, cx);
+        if let Some(active_item) = active_item_index.and_then(|index| items.get(index)?.clone()) {
+            pane.update_in(cx, |pane, window, cx| {
+                if let Some(index) = pane.index_for_item(active_item.as_ref()) {
+                    pane.activate_item(index, false, false, window, cx);
+                }
+            })?;
         }
-        if let Some(preview_item) = preview_item
-            && (!pane_had_items || pane.preview_item_id().is_none())
-        {
-            pane.set_preview_item_id(Some(preview_item), cx);
+
+        if let Some(preview_item) = preview_item_index.and_then(|index| items.get(index)?.clone()) {
+            pane.update(cx, |pane, cx| {
+                pane.set_preview_item_id(Some(preview_item.item_id()), cx);
+            })?;
         }
-        pane.set_pinned_count((first_index + restored_pinned_count).min(pane.items_len()));
-        placed_items
-    }
 
-    pub(crate) fn unrestored(
-        &self,
-        items: &[Option<Box<dyn ItemHandle>>],
-        now: i64,
-    ) -> Option<SerializedPane> {
-        let mut pinned_count = 0;
-        let children = self
-            .children
+        // `items` keeps a `None` for every item that failed to deserialize, and those
+        // were never added to the pane. Counting them would leave the pinned count
+        // pointing past the pinned tabs and pin unpinned ones in their place.
+        let pinned_count = items
             .iter()
-            .zip(items)
-            .enumerate()
-            .filter(|(_, (_, item))| item.is_none())
-            .filter_map(|(index, (serialized_item, _))| {
-                let unrestored_since = serialized_item.unrestored_since.unwrap_or(now);
-                if now - unrestored_since >= UNAVAILABLE_SESSION_WORKSPACE_RETENTION.num_seconds() {
-                    return None;
-                }
-                if index < self.pinned_count {
-                    pinned_count += 1;
-                }
-                Some(SerializedItem {
-                    unrestored_since: Some(unrestored_since),
-                    ..serialized_item.clone()
-                })
-            })
-            .collect::<Vec<_>>();
-        (!children.is_empty()).then(|| SerializedPane::new(children, self.active, pinned_count))
-    }
+            .take(self.pinned_count)
+            .filter(|item| item.is_some())
+            .count();
+        pane.update(cx, |pane, _| {
+            pane.set_pinned_count(pinned_count);
+        })?;
 
-    pub(crate) fn merge_pending(&mut self, pending: &SerializedPane) {
-        let live_keys = self
-            .children
-            .iter()
-            .map(SerializedItem::key)
-            .collect::<HashSet<_>>();
-        let live_has_active = self.children.iter().any(|item| item.active);
-        let live_has_preview = self.children.iter().any(|item| item.preview);
-        let insertion_index = self.pinned_count.min(self.children.len());
-        let mut pending_pinned_count = 0;
-        let pending_items = pending
-            .children
-            .iter()
-            .enumerate()
-            .filter(|(_, item)| !live_keys.contains(&item.key()))
-            .map(|(index, item)| {
-                if index < pending.pinned_count {
-                    pending_pinned_count += 1;
-                }
-                SerializedItem {
-                    active: item.active && !live_has_active,
-                    preview: item.preview && !live_has_preview,
-                    ..item.clone()
-                }
-            })
-            .collect::<Vec<_>>();
-        self.children
-            .splice(insertion_index..insertion_index, pending_items);
-        self.pinned_count = insertion_index + pending_pinned_count;
+        anyhow::Ok(items)
     }
 }
 
@@ -605,7 +495,6 @@ pub struct SerializedItem {
     pub item_id: ItemId,
     pub active: bool,
     pub preview: bool,
-    pub(crate) unrestored_since: Option<i64>,
 }
 
 impl SerializedItem {
@@ -615,12 +504,7 @@ impl SerializedItem {
             item_id,
             active,
             preview,
-            unrestored_since: None,
         }
-    }
-
-    pub(crate) fn key(&self) -> (Arc<str>, ItemId) {
-        (self.kind.clone(), self.item_id)
     }
 }
 
@@ -632,14 +516,13 @@ impl Default for SerializedItem {
             item_id: 100000,
             active: false,
             preview: false,
-            unrestored_since: None,
         }
     }
 }
 
 impl StaticColumnCount for SerializedItem {
     fn column_count() -> usize {
-        5
+        4
     }
 }
 impl Bind for &SerializedItem {
@@ -647,8 +530,7 @@ impl Bind for &SerializedItem {
         let next_index = statement.bind(&self.kind, start_index)?;
         let next_index = statement.bind(&self.item_id, next_index)?;
         let next_index = statement.bind(&self.active, next_index)?;
-        let next_index = statement.bind(&self.preview, next_index)?;
-        statement.bind(&self.unrestored_since, next_index)
+        statement.bind(&self.preview, next_index)
     }
 }
 
@@ -658,14 +540,12 @@ impl Column for SerializedItem {
         let (item_id, next_index) = ItemId::column(statement, next_index)?;
         let (active, next_index) = bool::column(statement, next_index)?;
         let (preview, next_index) = bool::column(statement, next_index)?;
-        let (unrestored_since, next_index) = Option::<i64>::column(statement, next_index)?;
         Ok((
             SerializedItem {
                 kind,
                 item_id,
                 active,
                 preview,
-                unrestored_since,
             },
             next_index,
         ))

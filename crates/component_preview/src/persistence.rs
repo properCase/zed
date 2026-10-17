@@ -1,7 +1,6 @@
-use anyhow::Result;
 use db::{
     query,
-    sqlez::{domain::Domain, statement::Statement, thread_safe_connection::ThreadSafeConnection},
+    sqlez::{domain::Domain, thread_safe_connection::ThreadSafeConnection},
     sqlez_macros::sql,
 };
 use workspace::{ItemId, WorkspaceDb, WorkspaceId};
@@ -26,27 +25,16 @@ impl Domain for ComponentPreviewDb {
 db::static_connection!(ComponentPreviewDb, [WorkspaceDb]);
 
 impl ComponentPreviewDb {
-    pub async fn save_active_page(
-        &self,
-        item_id: ItemId,
-        workspace_id: WorkspaceId,
-        active_page_id: String,
-    ) -> Result<()> {
-        log::debug!(
-            "Saving active page: item_id={item_id:?}, workspace_id={workspace_id:?}, active_page_id={active_page_id}"
-        );
-        let query = "INSERT INTO component_previews(item_id, workspace_id, active_page_id)
+    query! {
+        pub fn prepare_save_active_page(
+            item_id: ItemId,
+            workspace_id: WorkspaceId,
+            active_page_id: String,
+        ) -> Write {
+            INSERT INTO component_previews(item_id, workspace_id, active_page_id)
             VALUES (?1, ?2, ?3)
-            ON CONFLICT DO UPDATE SET
-                active_page_id = ?3";
-        self.write(move |conn| {
-            let mut statement = Statement::prepare(conn, query)?;
-            let mut next_index = statement.bind(&item_id, 1)?;
-            next_index = statement.bind(&workspace_id, next_index)?;
-            statement.bind(&active_page_id, next_index)?;
-            statement.exec()
-        })
-        .await
+            ON CONFLICT DO UPDATE SET active_page_id = ?3
+        }
     }
 
     query! {

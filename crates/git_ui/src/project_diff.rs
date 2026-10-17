@@ -11,6 +11,7 @@ use editor::{
     DefaultDiffHunkRenderer, Editor, EditorEvent, SplittableEditor,
     actions::{GoToHunk, GoToPreviousHunk, SendReviewToAgent},
 };
+use futures::future::BoxFuture;
 use git::{Commit, StageAll, StageAndNext, ToggleStaged, UnstageAll, UnstageAndNext};
 use gpui::{
     Action, App, AppContext as _, Entity, EventEmitter, FocusHandle, Focusable, Render,
@@ -631,8 +632,9 @@ impl SerializableItem for ProjectDiff {
         _: workspace::ItemId,
         _: bool,
         _: &mut Context<Self>,
-    ) -> Option<Task<Result<()>>> {
-        Some(Task::ready(Ok(())))
+    ) -> Option<BoxFuture<'static, Result<db::Write>>> {
+        let write: db::Write = Box::new(|_| Ok(()));
+        Some(Box::pin(async move { Ok(write) }))
     }
 
     fn should_serialize(&self, _: &Self::Event) -> bool {
@@ -686,13 +688,12 @@ pub(crate) mod persistence {
     db::static_connection!(ProjectDiffDb, [WorkspaceDb]);
 
     impl ProjectDiffDb {
-        pub async fn save_project_diff_base(
-            &self,
+        pub fn prepare_save_project_diff_base(
             item_id: ItemId,
             workspace_id: WorkspaceId,
             diff_base: DiffBase,
-        ) -> anyhow::Result<()> {
-            self.write(move |connection| {
+        ) -> db::Write {
+            Box::new(move |connection| {
                 let sql_stmt = sql!(
                     INSERT OR REPLACE INTO project_diffs(item_id, workspace_id, diff_base) VALUES (?, ?, ?)
                 );
@@ -703,7 +704,6 @@ pub(crate) mod persistence {
                     sql_stmt
                 ))
             })
-            .await
         }
 
         pub fn get_project_diff_base(

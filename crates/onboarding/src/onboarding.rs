@@ -24,7 +24,7 @@ use workspace::welcome::WelcomePage;
 use workspace::{
     AppState, Workspace, WorkspaceId,
     dock::DockPosition,
-    item::{Item, ItemEvent},
+    item::{BoxFuture, Item, ItemEvent},
     notifications::NotifyResultExt as _,
     open_new, register_serializable_item, with_active_or_new_workspace,
 };
@@ -630,16 +630,13 @@ impl workspace::SerializableItem for Onboarding {
         workspace: &mut Workspace,
         item_id: workspace::ItemId,
         _closing: bool,
-        cx: &mut ui::Context<Self>,
-    ) -> Option<gpui::Task<gpui::Result<()>>> {
+        _cx: &mut ui::Context<Self>,
+    ) -> Option<BoxFuture<'static, gpui::Result<db::Write>>> {
         let workspace_id = workspace.database_id()?;
 
-        let db = persistence::OnboardingPagesDb::global(cx);
-        Some(
-            cx.background_spawn(
-                async move { db.save_onboarding_page(item_id, workspace_id).await },
-            ),
-        )
+        Some(Box::pin(async move {
+            Ok(persistence::OnboardingPagesDb::prepare_save_onboarding_page(item_id, workspace_id))
+        }))
     }
 
     fn should_serialize(&self, event: &Self::Event) -> bool {
@@ -692,10 +689,10 @@ mod persistence {
 
     impl OnboardingPagesDb {
         query! {
-            pub async fn save_onboarding_page(
+            pub fn prepare_save_onboarding_page(
                 item_id: workspace::ItemId,
                 workspace_id: workspace::WorkspaceId
-            ) -> Result<()> {
+            ) -> Write {
                 INSERT OR REPLACE INTO onboarding_pages(item_id, workspace_id)
                 VALUES (?, ?)
             }

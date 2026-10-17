@@ -1,5 +1,22 @@
 #[macro_export]
 macro_rules! query {
+    ($vis:vis fn $id:ident($($arg:ident: $arg_type:ty),* $(,)?) -> Write { $($sql:tt)+ }) => {
+        $vis fn $id($($arg: $arg_type),*) -> $crate::Write {
+            use $crate::anyhow::Context;
+
+            ::std::boxed::Box::new(move |connection| {
+                let sql_stmt = $crate::sqlez_macros::sql!($($sql)+);
+
+                connection.exec_bound::<($($arg_type),*)>(sql_stmt)
+                    .and_then(|mut statement| statement(($($arg),*)))
+                    .context(::std::format!(
+                        "Error in {}, exec_bound failed to execute or parse for: {}",
+                        ::std::stringify!($id),
+                        sql_stmt
+                    ))
+            })
+        }
+    };
     ($vis:vis fn $id:ident() -> Result<()> { $($sql:tt)+ }) => {
         $vis fn $id(&self) -> $crate::anyhow::Result<()> {
             use $crate::anyhow::Context;

@@ -17,10 +17,12 @@ use fs::Fs;
 #[cfg(target_os = "windows")]
 mod wsl_picker;
 
-pub use dev_container_suggest::open_dev_container_from_cli;
 use remote::{RemoteConnectionOptions, same_remote_connection_identity};
-pub use remote_connection::{KnownPassword, RemoteConnectionModal, connect, connect_with_modal};
-pub use remote_connections::{navigate_to_positions, open_remote_project, restore_remote_project};
+pub use remote_connection::{RemoteConnectionModal, connect, connect_with_modal};
+pub use remote_connections::{
+    RemoteRestoreFocus, navigate_to_positions, open_remote_project,
+    resolve_remote_paths_with_positions, restore_remote_project,
+};
 
 use disconnected_overlay::DisconnectedOverlay;
 use fuzzy_nucleo::{StringMatch, StringMatchCandidate, match_strings};
@@ -505,39 +507,7 @@ pub fn init(cx: &mut App) {
     cx.observe_new(DisconnectedOverlay::register).detach();
 
     cx.on_action(|_: &OpenDevContainer, cx| {
-        with_active_or_new_workspace(cx, move |workspace, window, cx| {
-            if !workspace.project().read(cx).is_local() {
-                cx.spawn_in(window, async move |_, cx| {
-                    cx.prompt(
-                        gpui::PromptLevel::Critical,
-                        "Cannot open Dev Container from remote project",
-                        None,
-                        &["OK"],
-                    )
-                    .await
-                    .ok();
-                })
-                .detach();
-                return;
-            }
-
-            let fs = workspace.project().read(cx).fs().clone();
-            let configs = find_devcontainer_configs(workspace, cx);
-            let app_state = workspace.app_state().clone();
-            let dev_container_context = DevContainerContext::from_workspace(workspace, cx);
-            let handle = cx.entity().downgrade();
-            workspace.toggle_modal(window, cx, |window, cx| {
-                RemoteServerProjects::new_dev_container(
-                    fs,
-                    configs,
-                    app_state,
-                    dev_container_context,
-                    window,
-                    handle,
-                    cx,
-                )
-            });
-        });
+        with_active_or_new_workspace(cx, open_dev_container);
     });
 
     // Subscribe to worktree additions to suggest opening the project in a dev container
@@ -549,9 +519,16 @@ pub fn init(cx: &mut App) {
             // A workspace opened with `--dev-container` has its worktrees scanning
             // before this observer runs, so their update events can't be relied on
             // to trigger the auto-open.
-            if workspace.open_in_dev_container() {
-                dev_container_suggest::open_dev_container_from_cli(workspace, window, cx);
-            }
+            dev_container_suggest::open_dev_container_from_cli(workspace, window, cx);
+            cx.subscribe_in(&cx.entity(), window, |workspace, _, event, window, cx| {
+                if matches!(
+                    event,
+                    workspace::Event::WorkspaceCreated(_) | workspace::Event::OpenDevContainer
+                ) {
+                    dev_container_suggest::open_dev_container_from_cli(workspace, window, cx);
+                }
+            })
+            .detach();
             cx.subscribe_in(
                 workspace.project(),
                 window,
@@ -2490,12 +2467,47 @@ impl RecentProjectsDelegate {
     }
 }
 
+fn open_dev_container(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    if !workspace.project().read(cx).is_local() {
+        cx.spawn_in(window, async move |_, cx| {
+            cx.prompt(
+                gpui::PromptLevel::Critical,
+                "Cannot open Dev Container from remote project",
+                None,
+                &["OK"],
+            )
+            .await
+            .ok();
+        })
+        .detach();
+        return;
+    }
+
+    let fs = workspace.project().read(cx).fs().clone();
+    let configs = find_devcontainer_configs(workspace, cx);
+    let app_state = workspace.app_state().clone();
+    let dev_container_context = DevContainerContext::from_workspace(workspace, cx);
+    let handle = cx.entity().downgrade();
+    workspace.toggle_modal(window, cx, |window, cx| {
+        RemoteServerProjects::new_dev_container(
+            fs,
+            configs,
+            app_state,
+            dev_container_context,
+            window,
+            handle,
+            cx,
+        )
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use gpui::{TestAppContext, UpdateGlobal, VisualTestContext};
 
     use serde_json::json;
     use settings::SettingsStore;
+    use std::{cell::Cell, rc::Rc};
     use util::path;
     use workspace::{AppState, PathList, open_paths};
 
@@ -2933,6 +2945,232 @@ mod tests {
                 );
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    async fn test_cli_dev_container_targets_inactive_workspace_only_after_publication(
+        cx: &mut TestAppContext,
+    ) {
+        let app_state = init_test(cx);
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(path!("/initial-project"), json!({}))
+            .await;
+        let initial = cx
+            .update(|cx| {
+                open_paths(
+                    &[PathBuf::from(path!("/initial-project"))],
+                    app_state.clone(),
+                    OpenOptions::default(),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        let focused = initial
+            .workspace
+            .read_with(cx, |workspace, cx| workspace.focus_handle(cx));
+        initial
+            .window
+            .update(cx, |_, window, cx| window.focus(&focused, cx))
+            .unwrap();
+
+        for publish_in_constructor in [false, true] {
+            let target_path = if publish_in_constructor {
+                path!("/constructor-project")
+            } else {
+                path!("/deferred-project")
+            };
+            app_state
+                .fs
+                .as_fake()
+                .insert_tree(
+                    target_path,
+                    json!({
+                        ".devcontainer": {
+                            "rust": { "devcontainer.json": "{}" },
+                            "python": { "devcontainer.json": "{}" }
+                        },
+                        "owned.txt": "owned"
+                    }),
+                )
+                .await;
+
+            let observed_creation = Rc::new(Cell::new(false));
+            let _subscription = cx.update(|cx| {
+                let observed_creation = observed_creation.clone();
+                cx.observe_new(
+                    move |workspace: &mut Workspace, window, cx: &mut Context<Workspace>| {
+                        observed_creation.set(true);
+                        let published = workspace
+                            .app_state()
+                            .workspace_store
+                            .read(cx)
+                            .workspaces()
+                            .any(|published| published.entity_id() == cx.entity_id());
+                        assert_eq!(published, publish_in_constructor);
+                        if !published {
+                            assert!(workspace.open_in_dev_container());
+                            dev_container_suggest::open_dev_container_from_cli(
+                                workspace,
+                                window.unwrap(),
+                                cx,
+                            );
+                            assert!(workspace.open_in_dev_container());
+                        }
+                    },
+                )
+            });
+
+            let target = if publish_in_constructor {
+                let project =
+                    project::Project::test(app_state.fs.clone(), [Path::new(target_path)], cx)
+                        .await;
+                initial
+                    .window
+                    .update(cx, |multi_workspace, window, cx| {
+                        let workspace = cx.new(|cx| {
+                            let mut workspace =
+                                Workspace::new(None, project, app_state.clone(), window, cx);
+                            workspace.set_open_in_dev_container(true);
+                            workspace
+                        });
+                        multi_workspace.add(workspace.clone(), window, cx);
+                        window.focus(&focused, cx);
+                        workspace
+                    })
+                    .unwrap()
+            } else {
+                cx.update(|cx| {
+                    Workspace::new_local(
+                        vec![PathBuf::from(target_path)],
+                        app_state.clone(),
+                        Some(initial.window),
+                        None,
+                        Some(Box::new(|workspace, _, _| {
+                            workspace.set_open_in_dev_container(true);
+                        })),
+                        OpenMode::Add,
+                        cx,
+                    )
+                })
+                .await
+                .unwrap()
+                .workspace
+            };
+            cx.run_until_parked();
+            assert!(observed_creation.get());
+
+            let modal = initial
+                .window
+                .update(cx, |multi_workspace, window, cx| {
+                    assert_eq!(multi_workspace.workspace(), &initial.workspace);
+                    assert_eq!(window.focused(cx), Some(focused.clone()));
+                    assert!(
+                        initial
+                            .workspace
+                            .read(cx)
+                            .active_modal::<RemoteServerProjects>(cx)
+                            .is_none()
+                    );
+                    target.update(cx, |workspace, cx| {
+                        assert!(!workspace.open_in_dev_container());
+                        let modal = workspace.active_modal::<RemoteServerProjects>(cx).unwrap();
+                        cx.emit(workspace::Event::OpenDevContainer);
+                        modal
+                    })
+                })
+                .unwrap();
+            cx.run_until_parked();
+            target.read_with(cx, |workspace, cx| {
+                assert_eq!(
+                    workspace.active_modal::<RemoteServerProjects>(cx),
+                    Some(modal)
+                );
+            });
+
+            target
+                .read_with(cx, |workspace, cx| workspace.worktree_scans_complete(cx))
+                .await;
+            let unmatched_path = PathBuf::from(format!("{target_path}-unmatched.txt"));
+            app_state
+                .fs
+                .as_fake()
+                .insert_file(&unmatched_path, b"unmatched".to_vec())
+                .await;
+            let requests = Rc::new(Cell::new(0));
+            let _subscription = cx.update(|cx| {
+                let requests = requests.clone();
+                cx.subscribe(&target, move |_, event, _| {
+                    if matches!(event, workspace::Event::OpenDevContainer) {
+                        requests.set(requests.get() + 1);
+                    }
+                })
+            });
+            for paths in [
+                vec![PathBuf::from(target_path)],
+                vec![Path::new(target_path).join("owned.txt"), unmatched_path],
+            ] {
+                initial
+                    .window
+                    .update(cx, |_, window, cx| {
+                        target.update(cx, |workspace, cx| {
+                            assert!(workspace.hide_modal(window, cx));
+                        });
+                    })
+                    .unwrap();
+                requests.set(0);
+                let reopened = cx
+                    .update(|cx| {
+                        open_paths(
+                            &paths,
+                            app_state.clone(),
+                            OpenOptions {
+                                open_in_dev_container: true,
+                                ..OpenOptions::default()
+                            },
+                            cx,
+                        )
+                    })
+                    .await
+                    .unwrap();
+                cx.run_until_parked();
+                assert_eq!(reopened.workspace, target);
+                assert_eq!(reopened.window, initial.window);
+                assert_eq!(reopened.opened_items.len(), paths.len());
+                assert_eq!(requests.get(), 1);
+                target.read_with(cx, |workspace, cx| {
+                    assert!(!workspace.open_in_dev_container());
+                    assert!(workspace.active_modal::<RemoteServerProjects>(cx).is_some());
+                    if paths.len() == 2 {
+                        assert!(
+                            reopened
+                                .opened_items
+                                .iter()
+                                .all(|opened| opened.item.as_ref().is_some_and(Result::is_ok))
+                        );
+                        assert_eq!(workspace.items_of_type::<editor::Editor>(cx).count(), 2);
+                        assert_eq!(
+                            workspace.active_item(cx).unwrap().item_id(),
+                            reopened.opened_items[1]
+                                .item
+                                .as_ref()
+                                .unwrap()
+                                .as_ref()
+                                .unwrap()
+                                .item_id()
+                        );
+                    }
+                });
+            }
+            initial
+                .window
+                .update(cx, |multi_workspace, window, cx| {
+                    multi_workspace.activate(initial.workspace.clone(), None, window, cx);
+                })
+                .unwrap();
+        }
     }
 
     #[gpui::test]

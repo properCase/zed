@@ -41,7 +41,7 @@ use util::{
     rel_path::RelPath,
 };
 use workspace::item::{
-    Item, ItemBufferKind, ItemHandle, SaveOptions, SerializableItem, TabContentParams,
+    BoxFuture, Item, ItemBufferKind, ItemHandle, SaveOptions, SerializableItem, TabContentParams,
 };
 use workspace::notifications::{NotifyResultExt, NotifyTaskExt};
 use workspace::path_link::{PathMatching, resolve_open_target};
@@ -2269,7 +2269,7 @@ impl SerializableItem for MarkdownPreviewView {
         item_id: ItemId,
         _closing: bool,
         cx: &mut Context<Self>,
-    ) -> Option<Task<Result<()>>> {
+    ) -> Option<BoxFuture<'static, Result<db::Write>>> {
         let workspace_id = workspace.database_id()?;
         let editor = self.active_editor.as_ref()?.editor.clone();
         let buffer = editor.read(cx).buffer().read(cx).as_singleton()?;
@@ -2282,9 +2282,13 @@ impl SerializableItem for MarkdownPreviewView {
             .read(cx)
             .absolutize(file.path());
         let mode = self.mode.to_db();
-        let db = persistence::MarkdownPreviewDb::global(cx);
-        Some(cx.background_spawn(async move {
-            db.save_preview(item_id, workspace_id, abs_path, mode).await
+        Some(Box::pin(async move {
+            Ok(persistence::MarkdownPreviewDb::prepare_save_preview(
+                item_id,
+                workspace_id,
+                abs_path,
+                mode,
+            ))
         }))
     }
 
@@ -2330,12 +2334,12 @@ mod persistence {
 
     impl MarkdownPreviewDb {
         query! {
-            pub async fn save_preview(
+            pub fn prepare_save_preview(
                 item_id: ItemId,
                 workspace_id: WorkspaceId,
                 abs_path: PathBuf,
                 mode: i64
-            ) -> Result<()> {
+            ) -> Write {
                 INSERT OR REPLACE INTO markdown_previews(item_id, workspace_id, abs_path, mode)
                 VALUES (?, ?, ?, ?)
             }
@@ -2381,13 +2385,13 @@ mod tests {
     use workspace::item::{Item, ItemHandle, SerializableItem};
     use workspace::path_link::{OpenTarget, OpenTargetFoundBy};
     use workspace::{
-        AppState, MultiWorkspace, OpenOptions, OpenVisible, Pane, SaveIntent, Workspace,
+        AppState, ItemId, MultiWorkspace, OpenOptions, OpenVisible, Pane, SaveIntent, Workspace,
         WorkspaceId, open_paths,
     };
 
     use super::{
         MarkdownPreviewView, filter_non_rendered_matches, open_preview_url,
-        reset_persisted_font_size,
+        persistence::MarkdownPreviewDb, reset_persisted_font_size,
     };
 
     #[test]
@@ -3822,7 +3826,6 @@ mod tests {
             .update(cx, |multi_workspace, window, cx| {
                 let workspace = multi_workspace.workspace().clone();
                 workspace.update(cx, |workspace, cx| {
-                    workspace.set_random_database_id();
                     let workspace_id = workspace.database_id().unwrap();
                     let project = workspace.project().clone();
                     let editor: Entity<Editor> = workspace
@@ -3851,19 +3854,20 @@ mod tests {
             .update(cx, |multi_workspace, _window, cx| {
                 let workspace = multi_workspace.workspace().clone();
                 workspace.update(cx, |workspace, cx| {
-                    let item_id = workspace::persistent_item_id(&preview, cx);
                     preview
                         .update(cx, |preview, cx| {
-                            preview.serialize(workspace, item_id, false, cx)
+                            preview.serialize(workspace, cx.entity_id().as_u64(), false, cx)
                         })
                         .unwrap()
                 })
             })
             .unwrap();
-        serialize_task.await.unwrap();
+        let write = serialize_task.await.unwrap();
+        let db = cx.read(MarkdownPreviewDb::global);
+        db.write(write).await.unwrap();
 
         assert_eq!(
-            saved_preview_path(cx, &preview, workspace_id),
+            saved_preview_path(cx, preview.entity_id().as_u64(), workspace_id),
             PathBuf::from(path!("/dir/todo.md"))
         );
 
@@ -3898,7 +3902,7 @@ mod tests {
             Some(PathBuf::from(path!("/dir/subdir")))
         );
         assert_eq!(
-            saved_preview_path(cx, &preview, workspace_id),
+            saved_preview_path(cx, preview.entity_id().as_u64(), workspace_id),
             PathBuf::from(path!("/dir/subdir/renamed.md"))
         );
     }
@@ -3974,7 +3978,6 @@ mod tests {
         let (preview, workspace_id) = multi_workspace
             .update(cx, |multi_workspace, window, cx| {
                 multi_workspace.workspace().update(cx, |workspace, cx| {
-                    workspace.set_random_database_id();
                     let workspace_id = workspace.database_id().unwrap();
                     let preview = MarkdownPreviewView::create_following_markdown_view(
                         workspace, editor_a, window, cx,
@@ -4000,19 +4003,20 @@ mod tests {
             .update(cx, |multi_workspace, _window, cx| {
                 let workspace = multi_workspace.workspace().clone();
                 workspace.update(cx, |workspace, cx| {
-                    let item_id = workspace::persistent_item_id(&preview, cx);
                     preview
                         .update(cx, |preview, cx| {
-                            preview.serialize(workspace, item_id, false, cx)
+                            preview.serialize(workspace, cx.entity_id().as_u64(), false, cx)
                         })
                         .unwrap()
                 })
             })
             .unwrap();
-        serialize_task.await.unwrap();
+        let write = serialize_task.await.unwrap();
+        let db = cx.read(MarkdownPreviewDb::global);
+        db.write(write).await.unwrap();
 
         assert_eq!(
-            saved_preview_path(cx, &preview, workspace_id),
+            saved_preview_path(cx, preview.entity_id().as_u64(), workspace_id),
             PathBuf::from(path!("/dir/a.md"))
         );
 
@@ -4029,7 +4033,7 @@ mod tests {
         assert_eq!(followed_path.as_ref(), rel_path("b.md"));
 
         assert_eq!(
-            saved_preview_path(cx, &preview, workspace_id),
+            saved_preview_path(cx, preview.entity_id().as_u64(), workspace_id),
             PathBuf::from(path!("/dir/b.md")),
             "a Follow preview should persist the source editor it most recently followed"
         );
@@ -4895,13 +4899,12 @@ mod tests {
         cx.run_until_parked();
     }
 
-    fn saved_preview_path<T: 'static>(
+    fn saved_preview_path(
         cx: &mut TestAppContext,
-        item: &Entity<T>,
+        item_id: ItemId,
         workspace_id: WorkspaceId,
     ) -> PathBuf {
         cx.update(|cx| {
-            let item_id = workspace::persistent_item_id(item, cx);
             super::persistence::MarkdownPreviewDb::global(cx)
                 .get_preview(item_id, workspace_id)
                 .unwrap()

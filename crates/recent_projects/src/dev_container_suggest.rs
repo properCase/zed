@@ -174,6 +174,10 @@ pub fn open_dev_container_from_cli(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
+    if !workspace.open_in_dev_container() || !workspace.is_published() {
+        return;
+    }
+
     workspace.set_open_in_dev_container(false);
     let task = cx.spawn_in(window, async move |workspace, cx| {
         let scans_complete =
@@ -187,9 +191,23 @@ pub fn open_dev_container_from_cli(
                 .worktrees(cx)
                 .any(|worktree| !find_configs_in_snapshot(worktree.read(cx)).is_empty());
             if has_configs {
-                cx.on_next_frame(window, move |_workspace, window, cx| {
-                    window.dispatch_action(Box::new(zed_actions::OpenDevContainer), cx);
-                });
+                let inactive = workspace
+                    .multi_workspace()
+                    .and_then(|multi_workspace| multi_workspace.upgrade())
+                    .is_some_and(|multi_workspace| {
+                        multi_workspace.read(cx).workspace().entity_id() != cx.entity_id()
+                    });
+                let focused = window.focused(cx);
+                super::open_dev_container(workspace, window, cx);
+                if inactive {
+                    window.defer(cx, move |window, cx| {
+                        if let Some(focused) = focused {
+                            window.focus(&focused, cx);
+                        } else {
+                            window.blur(cx);
+                        }
+                    });
+                }
             } else {
                 log::warn!("--dev-container: no devcontainer configuration found in project");
             }

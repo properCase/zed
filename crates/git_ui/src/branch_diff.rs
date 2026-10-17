@@ -12,6 +12,7 @@ use editor::{
     Addon, Editor, EditorEvent, HiddenDiffHunkRenderer, SplittableEditor,
     actions::SendReviewToAgent,
 };
+use futures::future::BoxFuture;
 use git::{repository::DiffType, status::FileStatus};
 use gpui::{
     Action, App, AppContext as _, Entity, EventEmitter, FocusHandle, Focusable, Render,
@@ -646,13 +647,12 @@ impl SerializableItem for BranchDiff {
     }
 
     fn cleanup(
-        workspace_id: workspace::WorkspaceId,
-        alive_items: Vec<workspace::ItemId>,
+        _: workspace::WorkspaceId,
+        _: Vec<workspace::ItemId>,
         _: &mut Window,
-        cx: &mut App,
+        _: &mut App,
     ) -> Task<Result<()>> {
-        let db = project_diff::persistence::ProjectDiffDb::global(cx);
-        workspace::delete_unloaded_items(alive_items, workspace_id, "project_diffs", &db, cx)
+        Task::ready(Ok(()))
     }
 
     fn deserialize(
@@ -684,16 +684,20 @@ impl SerializableItem for BranchDiff {
         item_id: workspace::ItemId,
         _closing: bool,
         cx: &mut Context<Self>,
-    ) -> Option<Task<Result<()>>> {
+    ) -> Option<BoxFuture<'static, Result<db::Write>>> {
         let workspace_id = workspace.database_id()?;
         let DiffBase::Merge { base_ref } = self.diff_base(cx).clone() else {
             return None;
         };
         let diff_base = DiffBase::Merge { base_ref };
-        let db = project_diff::persistence::ProjectDiffDb::global(cx);
-        Some(cx.background_spawn(async move {
-            db.save_project_diff_base(item_id, workspace_id, diff_base)
-                .await
+        Some(Box::pin(async move {
+            Ok(
+                project_diff::persistence::ProjectDiffDb::prepare_save_project_diff_base(
+                    item_id,
+                    workspace_id,
+                    diff_base,
+                ),
+            )
         }))
     }
 

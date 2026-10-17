@@ -10,6 +10,7 @@ use crate::{
 use anyhow::Result;
 use client::{Client, proto};
 use futures::channel::mpsc;
+pub use futures::future::BoxFuture;
 use gpui::{
     Action, AnyElement, AnyEntity, AnyView, App, AppContext, Context, Entity, EntityId,
     EventEmitter, FocusHandle, Focusable, Font, Pixels, Point, Render, SharedString, Task, TaskExt,
@@ -406,6 +407,17 @@ pub trait Item: Focusable + EventEmitter<Self::Event> + Render + Sized {
     }
 }
 
+#[derive(Debug)]
+pub struct SavedItemRestoreError;
+
+impl std::fmt::Display for SavedItemRestoreError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Failed to restore saved item data")
+    }
+}
+
+impl std::error::Error for SavedItemRestoreError {}
+
 pub trait SerializableItem: Item {
     fn serialized_item_kind() -> &'static str;
 
@@ -431,20 +443,19 @@ pub trait SerializableItem: Item {
         item_id: ItemId,
         closing: bool,
         cx: &mut Context<Self>,
-    ) -> Option<Task<Result<()>>>;
+    ) -> Option<BoxFuture<'static, Result<db::Write>>>;
 
     fn should_serialize(&self, event: &Self::Event) -> bool;
 }
 
 pub trait SerializableItemHandle: ItemHandle {
     fn serialized_item_kind(&self) -> &'static str;
-    fn persistent_item_id(&self, cx: &mut App) -> ItemId;
     fn serialize(
         &self,
         workspace: &mut Workspace,
         closing: bool,
         cx: &mut App,
-    ) -> Option<Task<Result<()>>>;
+    ) -> Option<BoxFuture<'static, Result<db::Write>>>;
     fn should_serialize(&self, event: &dyn Any, cx: &App) -> bool;
 }
 
@@ -456,19 +467,23 @@ where
         T::serialized_item_kind()
     }
 
-    fn persistent_item_id(&self, cx: &mut App) -> ItemId {
-        crate::persistent_item_id(self, cx)
-    }
-
     fn serialize(
         &self,
         workspace: &mut Workspace,
         closing: bool,
         cx: &mut App,
-    ) -> Option<Task<Result<()>>> {
-        let item_id = self.persistent_item_id(cx);
-        self.update(cx, |this, cx| {
-            this.serialize(workspace, item_id, closing, cx)
+    ) -> Option<BoxFuture<'static, Result<db::Write>>> {
+        if workspace.session_id.is_none() {
+            return None;
+        }
+        if workspace.is_restoring() {
+            return (closing && workspace.restored_items.contains(&self.entity_id())).then(|| {
+                Box::pin(async { Ok::<db::Write, anyhow::Error>(Box::new(|_| Ok(()))) })
+                    as BoxFuture<'static, Result<db::Write>>
+            });
+        }
+        self.update(cx, |item, cx| {
+            item.serialize(workspace, cx.entity_id().as_u64(), closing, cx)
         })
     }
 
@@ -878,6 +893,7 @@ impl<T: Item> ItemHandle for Entity<T> {
                     if let Some(item) = item.to_serializable_item_handle(cx)
                         && item.should_serialize(event, cx)
                     {
+                        workspace.restored_items.remove(&item.item_id());
                         workspace.enqueue_item_serialization(item).ok();
                     }
 
@@ -940,6 +956,7 @@ impl<T: Item> ItemHandle for Entity<T> {
                         }
 
                         ItemEvent::Edit => {
+                            workspace.restored_items.remove(&item.item_id());
                             let autosave = item.workspace_settings(cx).autosave;
 
                             if let AutosaveSetting::AfterDelay { milliseconds } = autosave {
@@ -1431,37 +1448,20 @@ impl<T: FollowableItem> WeakFollowableItemHandle for WeakEntity<T> {
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test {
-    use super::{Item, ItemEvent, SerializableItem, TabContentParams};
+    use super::{BoxFuture, Item, ItemEvent, SerializableItem, TabContentParams};
     use crate::{
         ItemId, ItemNavHistory, Workspace, WorkspaceId,
         item::{ItemBufferKind, SaveOptions},
     };
-    use futures::{channel::oneshot, future::Shared};
     use gpui::{
         AnyElement, App, AppContext as _, Context, Entity, EntityId, EventEmitter, Focusable,
-        Global, InteractiveElement, IntoElement, ParentElement, Render, SharedString, Task,
-        WeakEntity, Window,
+        InteractiveElement, IntoElement, ParentElement, Render, SharedString, Task, WeakEntity,
+        Window,
     };
     use language::Capability;
     use project::{Project, ProjectEntryId, ProjectPath, WorktreeId};
     use std::{any::Any, cell::Cell, sync::Arc};
     use util::rel_path::rel_path;
-
-    pub struct PendingTestItemDeserialization(pub Shared<oneshot::Receiver<()>>);
-
-    impl Global for PendingTestItemDeserialization {}
-
-    pub struct PendingTestItemIds(pub Vec<ItemId>);
-
-    impl Global for PendingTestItemIds {}
-
-    pub struct TestItemDeserializationAwaitsEnvironment;
-
-    impl Global for TestItemDeserializationAwaitsEnvironment {}
-
-    pub struct FailingTestItemDeserialization;
-
-    impl Global for FailingTestItemDeserialization {}
 
     pub struct TestProjectItem {
         pub entry_id: Option<ProjectEntryId>,
@@ -1486,7 +1486,7 @@ pub mod test {
         pub nav_history: Option<ItemNavHistory>,
         pub tab_descriptions: Option<Vec<&'static str>>,
         pub tab_detail: Cell<Option<usize>>,
-        serialize: Option<Box<dyn Fn() -> Option<Task<anyhow::Result<()>>>>>,
+        serialize: Option<Box<dyn Fn() -> Option<BoxFuture<'static, anyhow::Result<db::Write>>>>>,
         focus_handle: gpui::FocusHandle,
         pub child_focus_handles: Vec<gpui::FocusHandle>,
     }
@@ -1634,7 +1634,7 @@ pub mod test {
 
         pub fn with_serialize(
             mut self,
-            serialize: impl Fn() -> Option<Task<anyhow::Result<()>>> + 'static,
+            serialize: impl Fn() -> Option<BoxFuture<'static, anyhow::Result<db::Write>>> + 'static,
         ) -> Self {
             self.serialize = Some(Box::new(serialize));
             self
@@ -1871,41 +1871,15 @@ pub mod test {
         }
 
         fn deserialize(
-            project: Entity<Project>,
+            _project: Entity<Project>,
             _workspace: WeakEntity<Workspace>,
             workspace_id: WorkspaceId,
-            item_id: ItemId,
+            _item_id: ItemId,
             _window: &mut Window,
             cx: &mut App,
         ) -> Task<anyhow::Result<Entity<Self>>> {
-            if cx.has_global::<FailingTestItemDeserialization>() {
-                return Task::ready(Err(anyhow::anyhow!("test item {item_id} is unavailable")));
-            }
-            if cx.has_global::<TestItemDeserializationAwaitsEnvironment>() {
-                let environment = project.read(cx).environment().clone();
-                let environment =
-                    environment.update(cx, |environment, cx| environment.default_environment(cx));
-                return cx.spawn(async move |cx| {
-                    environment.await;
-                    Ok(cx.new(|cx| Self::new_deserialized(workspace_id, cx)))
-                });
-            }
-            let item_is_pending = cx
-                .try_global::<PendingTestItemIds>()
-                .is_none_or(|PendingTestItemIds(item_ids)| item_ids.contains(&item_id));
-            match cx
-                .try_global::<PendingTestItemDeserialization>()
-                .filter(|_| item_is_pending)
-            {
-                Some(PendingTestItemDeserialization(pending)) => {
-                    let pending = pending.clone();
-                    cx.spawn(async move |cx| {
-                        pending.await.ok();
-                        Ok(cx.new(|cx| Self::new_deserialized(workspace_id, cx)))
-                    })
-                }
-                None => Task::ready(Ok(cx.new(|cx| Self::new_deserialized(workspace_id, cx)))),
-            }
+            let entity = cx.new(|cx| Self::new_deserialized(workspace_id, cx));
+            Task::ready(Ok(entity))
         }
 
         fn cleanup(
@@ -1923,7 +1897,7 @@ pub mod test {
             _item_id: ItemId,
             _closing: bool,
             _cx: &mut Context<Self>,
-        ) -> Option<Task<anyhow::Result<()>>> {
+        ) -> Option<BoxFuture<'static, anyhow::Result<db::Write>>> {
             if let Some(serialize) = self.serialize.take() {
                 let result = serialize();
                 self.serialize = Some(serialize);

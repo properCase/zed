@@ -39,8 +39,8 @@ use ui::{
 use ui_input::InputField;
 use util::ResultExt;
 use workspace::{
-    Item, ModalView, SerializableItem, Workspace, notifications::NotifyTaskExt as _,
-    register_serializable_item, with_active_or_new_workspace,
+    Item, ModalView, SerializableItem, Workspace, item::BoxFuture,
+    notifications::NotifyTaskExt as _, register_serializable_item, with_active_or_new_workspace,
 };
 
 pub use ui_components::*;
@@ -3991,13 +3991,15 @@ impl SerializableItem for KeymapEditor {
         workspace: &mut Workspace,
         item_id: workspace::ItemId,
         _closing: bool,
-        cx: &mut ui::Context<Self>,
-    ) -> Option<gpui::Task<gpui::Result<()>>> {
+        _cx: &mut ui::Context<Self>,
+    ) -> Option<BoxFuture<'static, gpui::Result<db::Write>>> {
         let workspace_id = workspace.database_id()?;
-        let db = KeybindingEditorDb::global(cx);
-        Some(cx.background_spawn(
-            async move { db.save_keybinding_editor(item_id, workspace_id).await },
-        ))
+        Some(Box::pin(async move {
+            Ok(KeybindingEditorDb::prepare_save_keybinding_editor(
+                item_id,
+                workspace_id,
+            ))
+        }))
     }
 
     fn should_serialize(&self, _event: &Self::Event) -> bool {
@@ -4030,10 +4032,10 @@ mod persistence {
 
     impl KeybindingEditorDb {
         query! {
-            pub async fn save_keybinding_editor(
+            pub fn prepare_save_keybinding_editor(
                 item_id: workspace::ItemId,
                 workspace_id: workspace::WorkspaceId
-            ) -> Result<()> {
+            ) -> Write {
                 INSERT OR REPLACE INTO keybinding_editors(item_id, workspace_id)
                 VALUES (?, ?)
             }
