@@ -1404,6 +1404,12 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn render_to_image(&self, _scene: &Scene) -> Result<RgbaImage> {
         anyhow::bail!("render_to_image not implemented for this platform")
     }
+
+    /// Draws the given scene off screen and returns its pixels as an RGBA image, in any build: an
+    /// app's screenshot of its own window. Platforms without it return an error.
+    fn capture_frame(&self, _scene: &Scene) -> anyhow::Result<image::RgbaImage> {
+        anyhow::bail!("capture_frame not implemented for this platform")
+    }
 }
 
 /// A renderer for headless windows that can produce real rendered output.

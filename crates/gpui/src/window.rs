@@ -2873,6 +2873,13 @@ impl Window {
             .render_to_image(&self.rendered_frame.scene)
     }
 
+    /// Draws the last rendered frame again off screen and returns its pixels as an RGBA image, in
+    /// any build. Only this window is in it, and it needs no screen recording permission.
+    pub fn capture_frame(&self) -> anyhow::Result<image::RgbaImage> {
+        self.platform_window
+            .capture_frame(&self.rendered_frame.scene)
+    }
+
     /// Returns the quads in the most recently rendered frame's scene, so tests can assert on
     /// painted output without rasterizing the frame. Quad bounds are in scaled pixels and are
     /// not clipped; each quad carries the content mask it will be clipped to when drawn. Quads

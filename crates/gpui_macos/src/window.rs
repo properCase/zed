@@ -2364,6 +2364,11 @@ impl PlatformWindow for MacWindow {
         this.renderer.render_to_image(scene)
     }
 
+    fn capture_frame(&self, scene: &gpui::Scene) -> anyhow::Result<image::RgbaImage> {
+        let mut this = self.0.lock();
+        this.renderer.capture_frame(scene)
+    }
+
     fn a11y_init(&self, callbacks: gpui::A11yCallbacks) {
         let mut lock = self.0.lock();
 

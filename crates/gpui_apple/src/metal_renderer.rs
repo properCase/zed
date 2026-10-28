@@ -6,7 +6,6 @@ use gpui::{
     AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, PaintSurface, Path, Point,
     PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
 };
-#[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 use image::RgbaImage;
 use objc2::runtime::AnyObject;
 
@@ -608,11 +607,26 @@ impl MetalRenderer {
         read_texture_to_image(drawable.texture())
     }
 
+    /// Draws a scene off screen at the window layer's drawable size and reads it back as RGBA.
+    /// Unlike `render_to_image` it never touches the layer's drawables, which are framebuffer-only
+    /// outside debug test builds, so it works in release builds: an app's screenshot of its own window.
+    pub fn capture_frame(&mut self, scene: &Scene) -> Result<RgbaImage> {
+        let layer = self
+            .layer
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("capture_frame requires a layer-backed renderer"))?;
+        let drawable = layer.drawable_size();
+        let size: Size<DevicePixels> = size(
+            (drawable.width.ceil() as i32).into(),
+            (drawable.height.ceil() as i32).into(),
+        );
+        self.render_scene_to_image(scene, size)
+    }
+
     /// Renders a scene to an image without requiring a window or CAMetalLayer.
     ///
     /// This is the primary method for headless rendering. It creates an offscreen
     /// texture, renders the scene to it, and returns the pixel data as an RGBA image.
-    #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
     pub fn render_scene_to_image(
         &mut self,
         scene: &Scene,
@@ -1308,7 +1322,6 @@ fn new_command_encoder_for_texture<'a>(
     command_encoder
 }
 
-#[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 fn read_texture_to_image(texture: &metal::TextureRef) -> Result<RgbaImage> {
     let width = texture.width() as u32;
     let height = texture.height() as u32;
