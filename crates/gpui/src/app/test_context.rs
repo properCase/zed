@@ -998,6 +998,20 @@ impl VisualTestContext {
         })
     }
 
+    /// Turns accessibility on for this window, as a screen reader connecting does, and draws it
+    /// again: from then on each frame builds the accessibility tree, which
+    /// [`Window::debug_a11y_tree_json`] gives. For tests that check every control has a role and a
+    /// name.
+    ///
+    /// Returns false when accessibility is disabled for the window
+    /// ([`TestAppContext::disable_accessibility`]).
+    pub fn enable_accessibility(&mut self) -> bool {
+        let on = self.cx.test_window(self.window).activate_a11y();
+        self.update(|window, _| window.refresh());
+        self.run_until_parked();
+        on
+    }
+
     /// Simulates the user resizing the window to the new size.
     pub fn simulate_resize(&self, size: Size<Pixels>) {
         self.simulate_window_resize(self.window, size)
@@ -1465,5 +1479,40 @@ mod tests {
 
         let response = receiver.await.unwrap().unwrap();
         assert_eq!(response, None);
+    }
+}
+
+#[cfg(test)]
+mod a11y_tests {
+    use crate::{
+        Context, InteractiveElement as _, IntoElement, ParentElement as _, Render,
+        StatefulInteractiveElement as _, TestAppContext, VisualTestContext, Window, div,
+    };
+
+    struct OneButton;
+
+    impl Render for OneButton {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().child(
+                div()
+                    .id("save")
+                    .role(accesskit::Role::Button)
+                    .aria_label("Save")
+                    .child("Save"),
+            )
+        }
+    }
+
+    #[crate::test]
+    fn enable_accessibility_builds_the_tree(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| OneButton);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let before = cx.update(|window, _| window.debug_a11y_tree_json());
+        assert!(before.is_none(), "no tree before accessibility is on");
+        assert!(cx.enable_accessibility());
+        let tree = cx
+            .update(|window, _| window.debug_a11y_tree_json())
+            .expect("a tree once accessibility is on");
+        assert!(tree.contains("Save"), "the button's name is in the tree: {tree}");
     }
 }

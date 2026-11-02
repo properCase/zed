@@ -58,6 +58,9 @@ pub(crate) struct TestWindowState {
     appearance: WindowAppearance,
     external_drag_files: Vec<(PathBuf, bool)>,
     start_external_drag_result: bool,
+    /// The accessibility adapter's callbacks, kept so a test can turn accessibility on
+    /// ([`crate::VisualTestContext::enable_accessibility`]) as a screen reader connecting does.
+    a11y_callbacks: Option<crate::A11yCallbacks>,
 }
 
 #[derive(Clone)]
@@ -82,6 +85,21 @@ impl HasDisplayHandle for TestWindow {
 }
 
 impl TestWindow {
+    /// Turns accessibility on, as a screen reader connecting to the window does: the window's
+    /// activation callback runs, so the frames drawn from then on build the accessibility tree.
+    ///
+    /// Returns false when the window gave no callbacks (accessibility disabled for it).
+    pub(crate) fn activate_a11y(&self) -> bool {
+        // Called without the window's lock held: the callback may reach back into the window.
+        let callbacks = self.0.lock().a11y_callbacks.take();
+        let Some(callbacks) = callbacks else {
+            return false;
+        };
+        let _ = (callbacks.activation)();
+        self.0.lock().a11y_callbacks = Some(callbacks);
+        true
+    }
+
     pub(crate) fn new(
         handle: AnyWindowHandle,
         params: WindowParams,
@@ -133,6 +151,7 @@ impl TestWindow {
             appearance: WindowAppearance::Light,
             external_drag_files: Vec::new(),
             start_external_drag_result: false,
+            a11y_callbacks: None,
         })))
     }
     pub fn simulate_scheduled_frame(&self) -> bool {
@@ -553,6 +572,10 @@ impl PlatformWindow for TestWindow {
         if let Some(renderer) = &mut state.renderer {
             renderer.render_scene(scene, device_size).warn_on_err();
         }
+    }
+
+    fn a11y_init(&self, callbacks: crate::A11yCallbacks) {
+        self.0.lock().a11y_callbacks = Some(callbacks);
     }
 
     fn sprite_atlas(&self) -> sync::Arc<dyn crate::PlatformAtlas> {
