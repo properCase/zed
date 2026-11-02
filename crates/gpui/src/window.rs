@@ -1627,12 +1627,6 @@ impl Window {
             },
         )?;
 
-        let tab_bar_visible = platform_window.tab_bar_visible();
-        SystemWindowTabController::init_visible(cx, tab_bar_visible);
-        if let Some(tabs) = platform_window.tabbed_windows() {
-            SystemWindowTabController::add_tab(cx, handle.window_id(), tabs);
-        }
-
         let display_id = platform_window.display().map(|display| display.id());
         let sprite_atlas = platform_window.sprite_atlas();
         let mouse_position = platform_window.mouse_position();
@@ -1650,6 +1644,17 @@ impl Window {
         let hovered = Rc::new(Cell::new(platform_window.is_hovered()));
         let needs_present = Rc::new(Cell::new(false));
         let next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
+        // The window's native tab group is read after its first frame, not here: on macOS asking for it makes
+        // AppKit set up the window's tab stack (about 20 ms), which would hold back the first frame of every
+        // launch. Native tabbing itself is AppKit's and starts with the window as before; only GPUI's record of
+        // it (`SystemWindowTabController`) is filled one frame later, and nothing reads that before then.
+        next_frame_callbacks.borrow_mut().push(Box::new(|window: &mut Window, cx: &mut App| {
+            let tab_bar_visible = window.platform_window.tab_bar_visible();
+            SystemWindowTabController::init_visible(cx, tab_bar_visible);
+            if let Some(tabs) = window.platform_window.tabbed_windows() {
+                SystemWindowTabController::add_tab(cx, window.handle.window_id(), tabs);
+            }
+        }));
         let input_rate_tracker = Rc::new(RefCell::new(InputRateTracker::default()));
         let last_frame_time = Rc::new(Cell::new(None));
 
