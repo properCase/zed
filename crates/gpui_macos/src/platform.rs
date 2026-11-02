@@ -491,6 +491,9 @@ impl MacPlatform {
                         SystemMenuType::Services => {
                             let app: id = msg_send![APP_CLASS, sharedApplication];
                             app.setServicesMenu_(item);
+                            // Windows send and take plain text (the window view's NSServicesMenuRequestor).
+                            let text: id = msg_send![class!(NSArray), arrayWithObject: cocoa::appkit::NSPasteboardTypeString];
+                            let _: () = msg_send![app, registerServicesMenuSendTypes: text returnTypes: text];
                         }
                     }
 

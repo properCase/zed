@@ -295,6 +295,21 @@ unsafe fn build_classes() {
                 sel!(characterIndexForPoint:),
                 character_index_for_point as extern "C" fn(&Object, Sel, NSPoint) -> u64,
             );
+
+            // Services (NSServicesMenuRequestor): the app menu's Services take the selected text and may give
+            // text back in its place, through the window's input handler.
+            decl.add_method(
+                sel!(validRequestorForSendType:returnType:),
+                valid_requestor_for_send_type as extern "C" fn(&Object, Sel, id, id) -> id,
+            );
+            decl.add_method(
+                sel!(writeSelectionToPasteboard:types:),
+                write_selection_to_pasteboard as extern "C" fn(&Object, Sel, id, id) -> BOOL,
+            );
+            decl.add_method(
+                sel!(readSelectionFromPasteboard:),
+                read_selection_from_pasteboard as extern "C" fn(&Object, Sel, id) -> BOOL,
+            );
             decl.register()
         };
         BLURRED_VIEW_CLASS = {
@@ -3511,6 +3526,66 @@ extern "C" fn attributed_substring_for_proposed_range(
     })
     .flatten()
     .unwrap_or(nil)
+}
+
+/// Whether a pasteboard type is plain text: the one kind the Services menu sends from a window and takes back.
+fn is_text_type(pasteboard_type: id) -> bool {
+    unsafe {
+        let modern: BOOL = msg_send![pasteboard_type, isEqualToString: cocoa::appkit::NSPasteboardTypeString];
+        let legacy: BOOL = msg_send![pasteboard_type, isEqualToString: ns_string("NSStringPboardType")];
+        modern == YES || legacy == YES
+    }
+}
+
+/// The input handler's selected text, `None` when nothing is selected or the window takes no text.
+fn selected_text(this: &Object) -> Option<String> {
+    with_input_handler(this, |input_handler| {
+        let selection = input_handler.selected_text_range(false)?;
+        if selection.range.is_empty() {
+            return None;
+        }
+        let mut adjusted: Option<Range<usize>> = None;
+        input_handler.text_for_range(selection.range, &mut adjusted)
+    })
+    .flatten()
+    .filter(|text| !text.is_empty())
+}
+
+/// Services asks whether the window can send its selection (as text) and take text back: it can when the window
+/// has an input handler, with a selection to send.
+extern "C" fn valid_requestor_for_send_type(this: &Object, _: Sel, send_type: id, return_type: id) -> id {
+    let sends = send_type == nil || (is_text_type(send_type) && selected_text(this).is_some());
+    let returns = return_type == nil || (is_text_type(return_type) && with_input_handler(this, |_| ()).is_some());
+    if (send_type != nil || return_type != nil) && sends && returns {
+        return this as *const Object as id;
+    }
+    unsafe { msg_send![super(this, class!(NSView)), validRequestorForSendType: send_type returnType: return_type] }
+}
+
+/// Services takes the selected text: it is written to the service's pasteboard as plain text.
+extern "C" fn write_selection_to_pasteboard(this: &Object, _: Sel, pasteboard: id, types: id) -> BOOL {
+    unsafe {
+        let wanted: BOOL = msg_send![types, containsObject: cocoa::appkit::NSPasteboardTypeString];
+        let legacy: BOOL = msg_send![types, containsObject: ns_string("NSStringPboardType")];
+        if wanted == NO && legacy == NO {
+            return NO;
+        }
+        let Some(text) = selected_text(this) else { return NO };
+        let _: i64 = msg_send![pasteboard, clearContents];
+        msg_send![pasteboard, setString: ns_string(&text) forType: cocoa::appkit::NSPasteboardTypeString]
+    }
+}
+
+/// A service gives text back: it replaces the selection, as typing would.
+extern "C" fn read_selection_from_pasteboard(this: &Object, _: Sel, pasteboard: id) -> BOOL {
+    unsafe {
+        let string: id = msg_send![pasteboard, stringForType: cocoa::appkit::NSPasteboardTypeString];
+        if string == nil {
+            return NO;
+        }
+        let text = string.to_str().to_string();
+        with_input_handler(this, |input_handler| input_handler.replace_text_in_range(None, &text)).is_some().to_objc()
+    }
 }
 
 // We ignore which selector it asks us to do because the user may have
