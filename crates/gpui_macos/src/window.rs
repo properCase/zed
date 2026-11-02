@@ -455,6 +455,11 @@ unsafe fn build_window_class(name: &'static str, superclass: &Class) -> *const C
             sel!(canBecomeKeyWindow),
             yes as extern "C" fn(&Object, Sel) -> BOOL,
         );
+        // The system's "Move focus to the window toolbar" shortcut (⌃F5 unless the person changed it).
+        decl.add_method(
+            sel!(_handleFocusToolbarHotKey:),
+            handle_focus_toolbar_hot_key as extern "C" fn(&Object, Sel, id),
+        );
         decl.add_method(
             sel!(windowDidResize:),
             window_did_resize as extern "C" fn(&Object, Sel, id),
@@ -3607,6 +3612,37 @@ extern "C" fn do_command_by_selector(this: &Object, _: Sel, _: Sel) {
     }
 
     state.as_ref().lock().event_callback = event_callback;
+}
+
+/// AppKit's handler for the system's "Move focus to the window toolbar" shortcut (⌃F5 by default, on in System
+/// Settings → Keyboard → Keyboard Shortcuts). The system takes the key before the window sees it and asks the key
+/// window to focus its `NSToolbar`. A window with one keeps AppKit's behavior; a GPUI window draws its own toolbars,
+/// so the request reaches the app as the ⌃F5 keystroke, for it to bind ("move to the tools") as it does any key.
+extern "C" fn handle_focus_toolbar_hot_key(this: &Object, _: Sel, sender: id) {
+    unsafe {
+        let toolbar: id = msg_send![this, toolbar];
+        if !toolbar.is_null() {
+            let _: () = msg_send![super(this, class!(NSWindow)), _handleFocusToolbarHotKey: sender];
+            return;
+        }
+    }
+    let state = unsafe { get_window_state(this) };
+    let mut callback = state.as_ref().lock().event_callback.take();
+    if let Some(callback) = callback.as_mut() {
+        callback(PlatformInput::KeyDown(KeyDownEvent {
+            keystroke: Keystroke {
+                modifiers: Modifiers {
+                    control: true,
+                    ..Default::default()
+                },
+                key: "f5".into(),
+                key_char: None,
+            },
+            is_held: false,
+            prefer_character_input: false,
+        }));
+    }
+    state.as_ref().lock().event_callback = callback;
 }
 
 extern "C" fn view_did_change_effective_appearance(this: &Object, _: Sel) {
