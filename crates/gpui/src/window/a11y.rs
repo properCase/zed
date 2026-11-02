@@ -146,6 +146,10 @@ pub(crate) struct A11y {
     /// determine whether we should actually send the finished [`TreeUpdate`].
     active_this_frame: bool,
     pub(crate) nodes: A11yNodeBuilder,
+    /// The frame's elements that can be pressed or focused but have no role (debug builds, while active).
+    pub(crate) roleless: Vec<String>,
+    /// The last finished frame's [`Self::roleless`].
+    pub(crate) roleless_last: Vec<String>,
     pub(crate) focus_ids: FxHashMap<NodeId, FocusId>,
     pub(crate) node_bounds: FxHashMap<NodeId, Bounds<Pixels>>,
     pub(crate) action_listeners: FxHashMap<NodeId, Vec<(Action, A11yActionListener)>>,
@@ -174,6 +178,8 @@ impl A11y {
             active_flag,
             active_this_frame: false,
             nodes: A11yNodeBuilder::new(),
+            roleless: Vec::new(),
+            roleless_last: Vec::new(),
             focus_ids: FxHashMap::default(),
             node_bounds: FxHashMap::default(),
             action_listeners: FxHashMap::default(),
@@ -273,6 +279,7 @@ impl A11y {
 
     /// Clear per-frame state and push the root node to start a new frame.
     pub(crate) fn begin_frame(&mut self) {
+        self.roleless.clear();
         self.focus_ids.clear();
         self.node_bounds.clear();
         self.action_listeners.clear();
@@ -281,6 +288,7 @@ impl A11y {
 
     /// Finalize the tree and produce a [`TreeUpdate`] for the platform adapter.
     pub(crate) fn end_frame(&mut self, frame: debug::FrameDebugInfo) -> TreeUpdate {
+        self.roleless_last = std::mem::take(&mut self.roleless);
         let update = self.nodes.finalize();
         self.debug.capture(
             &update,

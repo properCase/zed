@@ -1910,6 +1910,19 @@ impl Element for Div {
             .filter(|role| *role != accesskit::Role::GenericContainer)
     }
 
+    fn a11y_interactive(&self) -> Option<&'static str> {
+        let i = &self.interactivity;
+        if !i.click_listeners.is_empty() {
+            Some("click")
+        } else if !i.mouse_down_listeners.is_empty() {
+            Some("mouse-down")
+        } else if i.tracked_focus_handle.is_some() {
+            Some("focus")
+        } else {
+            None
+        }
+    }
+
     fn write_a11y_info(&self, node: &mut accesskit::Node) {
         self.interactivity.write_a11y_info(node);
     }
@@ -4110,6 +4123,10 @@ where
 
     fn a11y_role(&self) -> Option<accesskit::Role> {
         self.element.a11y_role()
+    }
+
+    fn a11y_interactive(&self) -> Option<&'static str> {
+        self.element.a11y_interactive()
     }
 
     fn write_a11y_info(&self, node: &mut accesskit::Node) {

@@ -114,6 +114,16 @@ pub trait Element: 'static + IntoElement {
         None
     }
 
+    /// Whether the element can be pressed or focused, and how: `"click"` (click listeners), `"mouse-down"`
+    /// (mouse-down listeners) or `"focus"` (a focus handle). Such an element needs a role, or assistive
+    /// technology can't reach it; with accessibility active, one without is listed by
+    /// [`Window::debug_a11y_roleless`] (debug builds).
+    ///
+    /// See the [accessibility guide](crate::_accessibility) for an overview.
+    fn a11y_interactive(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Write accessibility properties to the given node.
     /// Called only when `a11y_role()` returns `Some`.
     ///
@@ -425,6 +435,17 @@ impl<E: Element> Drawable<E> {
 
                 let bounds = window.layout_bounds(layout_id);
                 let mut pushed_a11y_node = false;
+                // An element that can be pressed or focused but has no role: not in the tree, so assistive technology
+                // can't reach it. Listed for tests ([`Window::debug_a11y_roleless`]).
+                #[cfg(debug_assertions)]
+                if window.a11y.is_active()
+                    && self.element.a11y_role().is_none()
+                    && let Some(how) = self.element.a11y_interactive()
+                {
+                    let id = global_id.as_ref().and_then(|g| g.last()).map_or("?".to_string(), |id| format!("{id:?}"));
+                    let at = self.element.source_location().map_or(String::new(), |l| format!(" ({l})"));
+                    window.a11y.roleless.push(format!("{id}{at}: can be reached by {how} but has no role"));
+                }
                 if window.a11y.is_active() {
                     if let Some(global_id) = global_id.as_ref() {
                         if let Some(role) = self.element.a11y_role() {

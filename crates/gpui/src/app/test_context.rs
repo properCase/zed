@@ -1515,4 +1515,31 @@ mod a11y_tests {
             .expect("a tree once accessibility is on");
         assert!(tree.contains("Save"), "the button's name is in the tree: {tree}");
     }
+
+    struct Roleless;
+
+    impl Render for Roleless {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .child(
+                    div()
+                        .id("named")
+                        .role(accesskit::Role::Button)
+                        .aria_label("Named")
+                        .on_click(|_, _, _| {}),
+                )
+                .child(div().id("bare").on_click(|_, _, _| {}).child("Bare"))
+        }
+    }
+
+    #[crate::test]
+    fn a_clickable_element_without_a_role_is_listed(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| Roleless);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        assert!(cx.update(|window, _| window.debug_a11y_roleless()).is_empty(), "nothing before accessibility is on");
+        assert!(cx.enable_accessibility());
+        let found = cx.update(|window, _| window.debug_a11y_roleless());
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("bare") && found[0].contains("click"), "{found:?}");
+    }
 }

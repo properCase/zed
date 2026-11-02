@@ -7019,6 +7019,13 @@ impl Window {
         self.a11y.debug_tree_json()
     }
 
+    /// The last frame's elements that can be pressed or focused (click or mouse-down listeners, a focus handle)
+    /// but have no role, so assistive technology can't reach them: one line each, the element's id, where it was
+    /// made and how it is reached. Recorded in debug builds while accessibility is active; empty otherwise.
+    pub fn debug_a11y_roleless(&self) -> Vec<String> {
+        self.a11y.roleless_last.clone()
+    }
+
     /// Register a listener for an accessibility action on a specific node.
     /// The listener will be called when a screen reader requests the given
     /// action on the node identified by `node_id`.
